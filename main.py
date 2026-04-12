@@ -740,51 +740,38 @@ def detect_language_keywords(text: str) -> str:
 
 async def transcribe_audio_cloudflare(audio_data: bytes) -> Tuple[str, str, float]:
     """
-    Transcribe audio using Cloudflare Workers AI Whisper Large v3 Turbo.
-    This is the fastest and most accurate model available.
-    Returns (text, detected_language, confidence)
+    Transcribe audio using Cloudflare Workers AI Whisper Turbo.
     """
     
-    # Log audio details for debugging
+    # Log audio details
     logger.info(f"Received audio: {len(audio_data)} bytes")
     
-    # Detect audio format from magic bytes
+    # Detect audio format
     if len(audio_data) >= 4:
-        if audio_data[:4] == b'RIFF':
-            logger.info("Detected WAV format")
-        elif audio_data[:4] == b'\x1aE\xdf\xa3':
+        if audio_data[:4] == b'\x1aE\xdf\xa3':
             logger.info("Detected WebM/Matroska format")
-        elif audio_data[:3] == b'ID3':
-            logger.info("Detected MP3 format")
-        elif audio_data[:4] == b'fLaC':
-            logger.info("Detected FLAC format")
-        elif audio_data[:4] == b'OggS':
-            logger.info("Detected OGG format")
-        else:
-            logger.warning(f"Unknown audio format, first 8 bytes: {audio_data[:8].hex()}")
+        elif audio_data[:4] == b'RIFF':
+            logger.info("Detected WAV format")
     
-    # Convert bytes to array of integers (Cloudflare's expected format)
+    # Convert bytes to list of integers (Cloudflare expects this format)
     audio_array = list(audio_data)
     
-    # Cloudflare has a 10MB limit for audio files
+    # Limit size if needed (Cloudflare has ~10MB limit)
     if len(audio_array) > 10_000_000:
-        logger.warning(f"Audio too large ({len(audio_array)} bytes), truncating to 10MB")
+        logger.warning(f"Audio too large ({len(audio_array)} bytes), truncating")
         audio_array = audio_array[:10_000_000]
     
-    # Use the turbo model - faster and more accurate
-    model = "@cf/openai/whisper-large-v3-turbo"
-    
     try:
+        # CORRECTED: Send audio as array in JSON
         response = await http_client.post(
-            f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/{model}",
+            f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/@cf/openai/whisper-large-v3-turbo",
             headers={
                 "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
                 "Content-Type": "application/json"
             },
             json={
-                "audio": audio_array,
-                "task": "transcribe",
-                "language": None  # Auto-detect
+                "audio": audio_array  # ← Array of integers, NOT string
+                # DO NOT include "language" field - let Whisper auto-detect
             },
             timeout=60.0
         )
@@ -795,7 +782,6 @@ async def transcribe_audio_cloudflare(audio_data: bytes) -> Tuple[str, str, floa
 
         data = response.json()
 
-        # Check for Cloudflare API errors
         if not data.get("success", False):
             errors = data.get("errors", [])
             error_msg = errors[0].get("message", "Unknown error") if errors else "Unknown error"
@@ -809,10 +795,8 @@ async def transcribe_audio_cloudflare(audio_data: bytes) -> Tuple[str, str, floa
             logger.warning("No text detected in audio")
             return "", "en", 0.0
         
-        # Whisper auto-detects language
+        # Get detected language
         detected_lang = result.get("language", "en")
-        
-        # Map Whisper language codes to our supported languages
         lang_map = {
             "en": "en", "english": "en",
             "ha": "ha", "hausa": "ha",
@@ -822,17 +806,9 @@ async def transcribe_audio_cloudflare(audio_data: bytes) -> Tuple[str, str, floa
         }
         detected_lang = lang_map.get(detected_lang.lower() if detected_lang else "en", "en")
         
-        # Extract word-level confidence if available
-        words = result.get("words", [])
-        if words:
-            confidence = sum(w.get("confidence", 0) for w in words) / len(words)
-        else:
-            confidence = 0.95  # Default high confidence for turbo model
-
-        logger.info(f"Transcription successful ({len(text)} chars, {detected_lang}, conf={confidence:.2f})")
-        logger.info(f"Text preview: '{text[:100]}...'")
+        logger.info(f"Transcription successful: '{text[:50]}...' ({detected_lang})")
         
-        return text, detected_lang, confidence
+        return text, detected_lang, 0.95
 
     except Exception as e:
         logger.error(f"Cloudflare transcription error: {e}")
