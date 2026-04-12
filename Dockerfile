@@ -1,8 +1,9 @@
 FROM python:3.11-slim
 
-# Install system dependencies including ffmpeg
+# Install system dependencies including ffmpeg AND git
 RUN apt-get update && apt-get install -y \
     ffmpeg \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
