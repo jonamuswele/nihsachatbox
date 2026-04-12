@@ -740,38 +740,34 @@ def detect_language_keywords(text: str) -> str:
 
 async def transcribe_audio_cloudflare(audio_data: bytes) -> Tuple[str, str, float]:
     """
-    Transcribe audio using Cloudflare Workers AI Whisper Turbo.
+    Transcribe audio using Cloudflare Workers AI Whisper.
+    Uses the correct model name and binary upload format.
     """
+    import io
     
-    # Log audio details
     logger.info(f"Received audio: {len(audio_data)} bytes")
     
-    # Detect audio format
-    if len(audio_data) >= 4:
-        if audio_data[:4] == b'\x1aE\xdf\xa3':
-            logger.info("Detected WebM/Matroska format")
-        elif audio_data[:4] == b'RIFF':
-            logger.info("Detected WAV format")
+    # Detect format for debugging
+    if len(audio_data) >= 4 and audio_data[:4] == b'\x1aE\xdf\xa3':
+        logger.info("Detected WebM/Matroska format")
     
-    # Convert bytes to list of integers (Cloudflare expects this format)
-    audio_array = list(audio_data)
-    
-    # Limit size if needed (Cloudflare has ~10MB limit)
-    if len(audio_array) > 10_000_000:
-        logger.warning(f"Audio too large ({len(audio_array)} bytes), truncating")
-        audio_array = audio_array[:10_000_000]
+    # Create a file-like object for the audio data
+    audio_file = io.BytesIO(audio_data)
     
     try:
-        # CORRECTED: Send audio as array in JSON
+        # Use the correct model name: "@cf/openai/whisper"
+        # Send as multipart/form-data with the file
         response = await http_client.post(
-            f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/@cf/openai/whisper-large-v3-turbo",
+            f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/@cf/openai/whisper",
             headers={
                 "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
-                "Content-Type": "application/json"
+                # Content-Type is set automatically when using files parameter
             },
-            json={
-                "audio": audio_array  # ← Array of integers, NOT string
-                # DO NOT include "language" field - let Whisper auto-detect
+            files={
+                "audio": ("recording.webm", audio_file, "audio/webm")
+            },
+            data={
+                "task": "transcribe"
             },
             timeout=60.0
         )
@@ -806,14 +802,13 @@ async def transcribe_audio_cloudflare(audio_data: bytes) -> Tuple[str, str, floa
         }
         detected_lang = lang_map.get(detected_lang.lower() if detected_lang else "en", "en")
         
-        logger.info(f"Transcription successful: '{text[:50]}...' ({detected_lang})")
+        logger.info(f"✅ Transcription successful: '{text[:50]}...' ({detected_lang})")
         
         return text, detected_lang, 0.95
 
     except Exception as e:
         logger.error(f"Cloudflare transcription error: {e}")
         raise
-
 
 # ============================================================================
 # GOOGLE TTS (with disk caching) - UNCHANGED
