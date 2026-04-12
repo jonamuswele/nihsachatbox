@@ -9,17 +9,13 @@ services:
         sync: false
       - key: GOOGLE_APPLICATION_CREDENTIALS_JSON
         sync: false
+      - key: CLOUDFLARE_ACCOUNT_ID
+        sync: false
+      - key: CLOUDFLARE_API_TOKEN
+        sync: false
       - key: NIHSA_API_URL
         value: https://nihsa-backend-20hh.onrender.com/api
       - key: ALLOWED_ORIGINS
         value: capacitor://localhost,http://localhost:3000,https://nihsa-backend-20hh.onrender.com
-      - key: WHISPER_MODEL
-        value: base
-      - key: WHISPER_DOWNLOAD_ROOT
-        value: /app/models
       - key: TTS_CACHE_DIR
         value: /app/tts_cache
-    disk:
-      name: model-storage
-      mountPath: /app/models
-      sizeGB: 2
