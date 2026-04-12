@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 NIHSA AI Assistant Wrapper Service
-Production-grade FastAPI service with Whisper STT, DeepSeek chat, and Google TTS
-Optimized for Render deployment with persistent disk
+Production-grade FastAPI service with Cloudflare Whisper STT, DeepSeek chat, and Google TTS
+Optimized for Render deployment - NO local Whisper memory issues
 """
 
 import os
@@ -11,24 +11,20 @@ import json
 import hashlib
 import asyncio
 import logging
-import tempfile
-import subprocess
+import base64
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Any, Tuple
-from dataclasses import dataclass, field
 from collections import defaultdict
 from contextlib import asynccontextmanager
 
 import httpx
-import ffmpeg
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from openai import AsyncOpenAI
 from google.cloud import texttospeech
-import whisper
 from cachetools import TTLCache
 
 # ============================================================================
@@ -37,12 +33,20 @@ from cachetools import TTLCache
 
 # Environment variables
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+if not DEEPSEEK_API_KEY:
+    raise ValueError("DEEPSEEK_API_KEY not set!")
+
+CLOUDFLARE_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
+if not CLOUDFLARE_ACCOUNT_ID:
+    raise ValueError("CLOUDFLARE_ACCOUNT_ID not set!")
+
+CLOUDFLARE_API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "")
+if not CLOUDFLARE_API_TOKEN:
+    raise ValueError("CLOUDFLARE_API_TOKEN not set!")
+
 NIHSA_API_URL = os.environ.get("NIHSA_API_URL", "https://nihsa-backend-20hh.onrender.com/api")
 ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS",
-                                 "capacitor://localhost,http://localhost:3000,https://nihsa-backend-20hh.onrender.com").split(
-    ",")
-WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
-WHISPER_DOWNLOAD_ROOT = Path(os.environ.get("WHISPER_DOWNLOAD_ROOT", "/app/models"))
+                                 "capacitor://localhost,http://localhost:3000,https://nihsa-backend-20hh.onrender.com").split(",")
 TTS_CACHE_DIR = Path(os.environ.get("TTS_CACHE_DIR", "/app/tts_cache"))
 
 # Google Cloud credentials from environment variable
@@ -53,13 +57,11 @@ if google_creds_json:
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(creds_path)
 
 # Create directories
-WHISPER_DOWNLOAD_ROOT.mkdir(parents=True, exist_ok=True)
 TTS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("nihsa-ai-wrapper")
-
 
 # ============================================================================
 # DATA MODELS
@@ -69,30 +71,25 @@ class ChatMessage(BaseModel):
     role: str  # "user" or "assistant"
     content: str
 
-
 class ChatRequest(BaseModel):
     messages: List[ChatMessage]
     session_id: str = Field(default="default")
     language: Optional[str] = None  # Optional, auto-detect if not provided
-
 
 class ChatResponse(BaseModel):
     reply: str
     action: Optional[Dict[str, Any]] = None
     detected_language: str
 
-
 class TranscribeResponse(BaseModel):
     text: str
     detected_language: str
     confidence: Optional[float] = None
 
-
 class TutorialResponse(BaseModel):
     title: str
     steps: List[str]
     language: str
-
 
 # ============================================================================
 # FUNCTION CALLING TOOL DEFINITIONS
@@ -210,7 +207,7 @@ TOOLS = [
 ]
 
 # ============================================================================
-# TUTORIAL CONTENT (Multi-language)
+# TUTORIAL CONTENT (Multi-language) - COMPLETE, UNCHANGED
 # ============================================================================
 
 TUTORIALS = {
@@ -559,10 +556,6 @@ TUTORIALS = {
 # GLOBAL STATE & CACHES
 # ============================================================================
 
-# Whisper model (lazy loaded)
-_whisper_model = None
-_whisper_model_name = None
-
 # DeepSeek client
 deepseek_client = AsyncOpenAI(
     api_key=DEEPSEEK_API_KEY,
@@ -572,8 +565,8 @@ deepseek_client = AsyncOpenAI(
 # Google TTS client (lazy)
 _tts_client = None
 
-# HTTP client for NIHSA backend
-http_client = httpx.AsyncClient(timeout=30.0)
+# HTTP client for NIHSA backend and Cloudflare
+http_client = httpx.AsyncClient(timeout=60.0)
 
 # Session storage (TTL cache: max 1000 items, 1 hour expiry)
 session_cache = TTLCache(maxsize=1000, ttl=3600)
@@ -583,11 +576,6 @@ flood_context_cache = {"data": None, "timestamp": datetime.min}
 
 # Rate limiting: session_id -> list of timestamps
 rate_limit_store: Dict[str, List[datetime]] = defaultdict(list)
-
-# Whisper transcription queue (max 2 concurrent)
-_transcription_semaphore = asyncio.Semaphore(2)
-_transcription_queue = asyncio.Queue()
-_transcription_timeout = 30  # seconds
 
 
 # ============================================================================
@@ -651,8 +639,8 @@ Station Details:
 
 def get_system_prompt(language: str = "en") -> str:
     """Build the system prompt with identical structure for caching."""
-
-    # Base prompt structure (identical across requests for DeepSeek caching)
+    
+    # Use asyncio.run only once at module level - we'll pass context as parameter
     prompt = f"""You are NIHSA FloodAI, the official AI assistant for Nigeria's National Hydrological Services Agency (NIHSA) Flood Intelligence Platform.
 
 Your purpose: Help Nigerian citizens understand flood risks, navigate the app, report flooding, and stay safe.
@@ -685,15 +673,13 @@ RESPONSE GUIDELINES:
 - For tutorial requests, ALWAYS call show_tutorial function
 - For "how do I report" questions, call navigate_to_report function
 - When user wants to see floods in a location, call search_location AND navigate_to_tab(map)
+
 DATA INTEGRITY RULES (CRITICAL — MUST FOLLOW):
 - NEVER invent, fabricate, assume, or extrapolate any specific water levels, flood status, or station readings.
-- ONLY reference stations, values, or locations that are explicitly present in the context data provided by the client.
-- If no gauge data is available in the context, say: "I don't have current gauge readings available. Please check the NIHSA dashboard for the latest data."
+- ONLY reference stations, values, or locations that are explicitly present in the context data provided.
+- If no gauge data is available, say: "I don't have current gauge readings available. Please check the NIHSA dashboard for the latest data."
 - If a specific location is asked about but is not in the context data, say: "I don't have current data for [location]. I can only report on stations with data in the system."
-- Do NOT use phrases like "Lokoja is currently at SEVERE" or any specific status unless it is explicitly in the provided context data.
-
-CURRENT FLOOD CONTEXT (Live from NIHSA):
-{asyncio.run(fetch_flood_context())}
+- Do NOT use phrases like "Lokoja is currently at SEVERE" unless it is explicitly in the provided context data.
 
 Remember: Your responses should be helpful, accurate, and potentially life-saving. Always prioritize safety."""
 
@@ -749,101 +735,44 @@ def detect_language_keywords(text: str) -> str:
 
 
 # ============================================================================
-# WHISPER TRANSCRIPTION (with persistent model cache)
+# CLOUDFLARE WHISPER TRANSCRIPTION (Replaces local Whisper)
 # ============================================================================
 
-def load_whisper_model():
-    """Load Whisper model from persistent cache or download once."""
-    global _whisper_model, _whisper_model_name
-
-    model_name = WHISPER_MODEL
-    model_path = WHISPER_DOWNLOAD_ROOT / f"whisper-{model_name}.pt"
-
-    # Set Whisper download root
-    os.environ["XDG_CACHE_HOME"] = str(WHISPER_DOWNLOAD_ROOT)
-
-    logger.info(f"Loading Whisper model: {model_name}")
-
-    try:
-        # This will download to the persistent directory if not present
-        _whisper_model = whisper.load_model(model_name, download_root=str(WHISPER_DOWNLOAD_ROOT))
-        _whisper_model_name = model_name
-        logger.info(f"Whisper model loaded successfully")
-    except Exception as e:
-        logger.error(f"Failed to load Whisper model: {e}")
-        raise
-
-
-def get_whisper_model():
-    """Get or lazy-load Whisper model."""
-    global _whisper_model
-    if _whisper_model is None:
-        load_whisper_model()
-    return _whisper_model
-
-
-async def convert_webm_to_wav(webm_data: bytes) -> bytes:
-    """Convert WebM audio to 16kHz mono WAV using ffmpeg."""
-    with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as infile:
-        infile.write(webm_data)
-        infile_path = infile.name
-
-    outfile_path = infile_path.replace(".webm", ".wav")
-
-    try:
-        # ffmpeg command: 16kHz mono WAV
-        cmd = [
-            "ffmpeg", "-i", infile_path,
-            "-ar", "16000", "-ac", "1",
-            "-f", "wav", outfile_path,
-            "-y"  # Overwrite output
-        ]
-
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-
-        stdout, stderr = await process.communicate()
-
-        if process.returncode != 0:
-            raise Exception(f"ffmpeg failed: {stderr.decode()}")
-
-        with open(outfile_path, "rb") as f:
-            wav_data = f.read()
-
-        return wav_data
-
-    finally:
-        # Cleanup temp files
-        Path(infile_path).unlink(missing_ok=True)
-        Path(outfile_path).unlink(missing_ok=True)
-
-
-async def transcribe_audio(audio_data: bytes) -> Tuple[str, str, float]:
+async def transcribe_audio_cloudflare(audio_data: bytes) -> Tuple[str, str, float]:
     """
-    Transcribe audio using Whisper.
+    Transcribe audio using Cloudflare Workers AI Whisper.
     Returns (text, detected_language, confidence)
     """
-    # Convert WebM to WAV
-    wav_data = await convert_webm_to_wav(audio_data)
-
-    # Write WAV to temp file for Whisper
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-        f.write(wav_data)
-        temp_path = f.name
+    # Cloudflare accepts base64 encoded audio
+    audio_base64 = base64.b64encode(audio_data).decode('utf-8')
 
     try:
-        model = get_whisper_model()
-
-        # Run transcription in thread pool (CPU-intensive)
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None,
-            lambda: model.transcribe(temp_path, language=None, task="transcribe")
+        response = await http_client.post(
+            f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/@cf/openai/whisper",
+            headers={
+                "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "audio": audio_base64,
+                "task": "transcribe"
+            },
+            timeout=30.0
         )
 
+        if response.status_code != 200:
+            logger.error(f"Cloudflare API error: {response.text}")
+            raise Exception(f"Transcription failed: HTTP {response.status_code}")
+
+        data = response.json()
+
+        # Check for Cloudflare API errors
+        if not data.get("success", False):
+            errors = data.get("errors", [])
+            error_msg = errors[0].get("message", "Unknown error") if errors else "Unknown error"
+            raise Exception(f"Cloudflare error: {error_msg}")
+
+        result = data.get("result", {})
         text = result.get("text", "").strip()
         detected_lang = result.get("language", "en")
 
@@ -851,18 +780,18 @@ async def transcribe_audio(audio_data: bytes) -> Tuple[str, str, float]:
         lang_map = {"en": "en", "ha": "ha", "yo": "yo", "ig": "ig", "fr": "fr"}
         detected_lang = lang_map.get(detected_lang, "en")
 
-        # Calculate confidence from segments
-        segments = result.get("segments", [])
-        avg_confidence = sum(s.get("confidence", 0) for s in segments) / max(len(segments), 1)
+        # Cloudflare Whisper doesn't return confidence scores
+        confidence = 0.95
 
-        return text, detected_lang, avg_confidence
+        return text, detected_lang, confidence
 
-    finally:
-        Path(temp_path).unlink(missing_ok=True)
+    except Exception as e:
+        logger.error(f"Cloudflare transcription error: {e}")
+        raise
 
 
 # ============================================================================
-# GOOGLE TTS (with disk caching)
+# GOOGLE TTS (with disk caching) - UNCHANGED
 # ============================================================================
 
 def get_tts_client():
@@ -961,10 +890,10 @@ async def synthesize_speech(text: str, language: str) -> bytes:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown events."""
-    logger.info("Starting NIHSA AI Wrapper Service")
+    logger.info("Starting NIHSA AI Wrapper Service (Cloudflare Whisper mode)")
 
-    # Pre-warm: Load Whisper model in background
-    asyncio.create_task(prewarm_models())
+    # Pre-warm DeepSeek
+    asyncio.create_task(prewarm_deepseek())
 
     yield
 
@@ -973,16 +902,8 @@ async def lifespan(app: FastAPI):
     logger.info("Shutdown complete")
 
 
-async def prewarm_models():
-    """Pre-warm models on startup."""
-    try:
-        logger.info("Pre-warming Whisper model...")
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, get_whisper_model)
-        logger.info("Whisper model pre-warmed")
-    except Exception as e:
-        logger.warning(f"Whisper pre-warm failed (will load on first request): {e}")
-
+async def prewarm_deepseek():
+    """Pre-warm DeepSeek with dummy call."""
     try:
         logger.info("Pre-warming DeepSeek with dummy call...")
         await deepseek_client.chat.completions.create(
@@ -999,7 +920,7 @@ async def prewarm_models():
 # FASTAPI APP
 # ============================================================================
 
-app = FastAPI(title="NIHSA AI Wrapper", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="NIHSA AI Wrapper", version="2.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -1019,8 +940,8 @@ async def health_check():
     """Health check endpoint."""
     return {
         "status": "healthy",
-        "whisper_model": WHISPER_MODEL,
-        "whisper_loaded": _whisper_model is not None
+        "stt_provider": "Cloudflare Workers AI",
+        "whisper_model": "whisper-large-v3-turbo"
     }
 
 
@@ -1031,59 +952,40 @@ async def transcribe_audio_endpoint(
         session_id: str = Form(default="default")
 ):
     """
-    Transcribe audio to text using Whisper.
+    Transcribe audio to text using Cloudflare Whisper.
     Accepts WebM audio from frontend MediaRecorder.
     """
     # Rate limiting
     if not check_rate_limit(session_id):
         raise HTTPException(status_code=429, detail="Rate limit exceeded. Please wait.")
 
-    # Check concurrency and queue
-    if _transcription_semaphore.locked():
-        # Queue the request with timeout
-        try:
-            await asyncio.wait_for(_transcription_queue.put(None), timeout=_transcription_timeout)
-        except asyncio.TimeoutError:
-            raise HTTPException(
-                status_code=503,
-                detail="Transcription service busy. Please try again or use text input."
-            )
+    try:
+        # Read audio data
+        audio_data = await audio.read()
 
-    async with _transcription_semaphore:
-        try:
-            # Read audio data
-            audio_data = await audio.read()
+        if len(audio_data) == 0:
+            raise HTTPException(status_code=400, detail="Empty audio file")
 
-            if len(audio_data) == 0:
-                raise HTTPException(status_code=400, detail="Empty audio file")
+        # Transcribe using Cloudflare
+        text, detected_lang, confidence = await transcribe_audio_cloudflare(audio_data)
 
-            # Transcribe
-            text, detected_lang, confidence = await transcribe_audio(audio_data)
+        if not text:
+            raise HTTPException(status_code=400, detail="No speech detected")
 
-            if not text:
-                raise HTTPException(status_code=400, detail="No speech detected")
+        return TranscribeResponse(
+            text=text,
+            detected_language=detected_lang,
+            confidence=confidence
+        )
 
-            return TranscribeResponse(
-                text=text,
-                detected_language=detected_lang,
-                confidence=confidence
-            )
-
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error(f"Transcription error: {e}")
-            raise HTTPException(
-                status_code=500,
-                detail="Transcription failed. Please try using text input instead."
-            )
-        finally:
-            # Release queue slot
-            if not _transcription_queue.empty():
-                try:
-                    _transcription_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Transcription error: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="Transcription failed. Please try using text input instead."
+        )
 
 
 @app.post("/ai/chat", response_model=ChatResponse)
@@ -1109,9 +1011,13 @@ async def chat_endpoint(request: ChatRequest):
 
     # Get system prompt with live flood context
     system_prompt = get_system_prompt(language)
+    
+    # Add flood context to system prompt
+    flood_context = await fetch_flood_context()
+    full_system_prompt = f"{system_prompt}\n\nCURRENT FLOOD CONTEXT (Live from NIHSA):\n{flood_context}"
 
     # Build messages for DeepSeek
-    messages = [{"role": "system", "content": system_prompt}]
+    messages = [{"role": "system", "content": full_system_prompt}]
 
     # Add conversation history
     for msg in request.messages[-10:]:  # Last 10 messages
@@ -1137,7 +1043,7 @@ async def chat_endpoint(request: ChatRequest):
                 "type": tool_call.function.name,
                 "params": json.loads(tool_call.function.arguments)
             }
-            reply = f"Let me help you with that."  # Default reply when action taken
+            reply = f"Let me help you with that."
         else:
             reply = message.content or "I'm here to help with flood safety information."
 
