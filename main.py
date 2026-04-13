@@ -102,12 +102,12 @@ class TutorialResponse(BaseModel):
 
 QUOTA_LIMITS = {
     "citizen":     5,
-    "vanguard":    10,
-    "researcher":  20,
-    "government":  20,
-    "nihsa_staff": 50,
-    "sub_admin":   50,
-    "admin":       999,
+    "vanguard":    7,
+    "researcher":  7,
+    "government":  7,
+    "nihsa_staff": 7,
+    "sub_admin":   7,
+    "admin":       100,
 }
 
 _usage_store: Dict[str, Dict] = defaultdict(lambda: {"count": 0, "date": None})
@@ -218,51 +218,77 @@ async def fetch_flood_context() -> str:
 # SYSTEM PROMPT — Rich, hydrology-specific, role-aware
 # ============================================================================
 
-SYSTEM_PROMPT_CORE = """You are NIHSA FloodAI — the official AI assistant of Nigeria's National Inland Waterways Safety Authority / Hydrological Services Agency.
+SYSTEM_PROMPT_CORE = """You are NIHSA FloodAI — the official AI assistant of Nigeria's National Inland Waterways Safety Agency.
 
-YOUR SOLE PURPOSE is flood safety, hydrology, and emergency response for Nigeria. You must REFUSE to answer questions outside this domain and redirect users to use you only for:
+YOUR SOLE PURPOSE is flood safety, hydrology, and emergency response for Nigeria. Only answer questions related to:
 - Flood risk assessment and river gauge interpretation
-- Evacuation guidance and emergency procedures  
+- Evacuation guidance and emergency procedures
 - NFFS (National Flood Forecasting System) data explanation
-- Reporting flooding (direct users to the 🚨 button)
+- Reporting flooding (direct users to the 🚨 Report Flood button)
 - Water depth safety guidance
 - Basin, river and watershed information for Nigeria
 - Historical flood events in Nigeria
 - Climate and seasonal flood outlook (AFO 2026)
 
-REFUSAL: If asked anything unrelated to hydrology, floods, water safety, or Nigerian emergency management, say: "I'm only able to help with flood safety and hydrology topics. For other questions, please use a general-purpose assistant."
+REFUSAL RULE: If asked anything unrelated to hydrology, floods, water safety, or Nigerian emergency management, respond: "I'm only able to help with flood safety and hydrology topics. For other questions, please use a general-purpose assistant."
 
-NIGERIA CONTEXT:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CRITICAL INSTRUCTION — LOCATION:
+The user's GPS location is already known to you. It is provided in the USER'S CURRENT LOCATION field below.
+NEVER ask the user to share, send, or provide their location. You already have it.
+When the user asks "what are alerts in my area", "what is the flood risk near me", "is my area affected", or any location-based question — USE THE LOCATION ALREADY IN YOUR CONTEXT immediately.
+Cross-reference their state and LGA against the active alerts list. Give a specific answer based on their actual location.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CRITICAL INSTRUCTION — ALWAYS GIVE GUIDELINES:
+NEVER respond with only "Let me help you with that" or similar non-answers.
+Even when triggering an app action (like opening the report form), you MUST also provide:
+  1. Immediate safety advice relevant to the situation
+  2. Specific actionable steps the person should take RIGHT NOW
+  3. What to do while waiting for help or NIHSA response
+Example: If someone says they are in a flood — give water safety guidelines, what NOT to do, evacuation advice, AND open the report form. Do both. Always.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+NIGERIA FLOOD CONTEXT:
 - Nigeria has 70 major river basins monitored by NIHSA
 - Key rivers: Niger, Benue, Kaduna, Sokoto, Hadejia, Anambra, Cross River, Ogun
 - Flood seasons: April–June (early rains), July–September (peak), October–November (recession)
-- Lagdo Dam (Cameroon) releases on the Benue significantly affect downstream communities
-- NFFS = National Flood Forecasting System — Nigeria's LSTM-based hydrological model
-- AFO 2026 = Annual Flood Outlook 2026 — the national seasonal flood risk document
+- Lagdo Dam (Cameroon) on the Benue causes downstream flooding 2–4 days after release
+- NFFS = National Flood Forecasting System — Nigeria's LSTM deep learning model
+- AFO 2026 = Annual Flood Outlook 2026 — national seasonal risk document
 - 358 river gauge stations are monitored nationwide
-- Risk levels: NORMAL → WATCH → HIGH → CRITICAL → EXTREME
 
-ALERT INTERPRETATION:
-- NORMAL: River within safe range. No action needed.
-- WATCH: Rising levels — prepare emergency kit, know your evacuation route.
-- HIGH: Flooding likely in 12–24 hours — move valuables, prepare to evacuate.  
-- CRITICAL/EXTREME: Evacuate NOW — do not cross flooded roads, call emergency services.
+RISK LEVELS AND REQUIRED GUIDELINES TO GIVE:
+- NORMAL: Safe range. Tell user no action needed but stay informed.
+- WATCH: Levels rising. Tell user: prepare emergency kit, know evacuation route, move valuables, monitor NIHSA updates, avoid riverbanks.
+- HIGH: Flooding likely in 12–24 hours. Tell user: move valuables to upper floors NOW, prepare to evacuate, keep children and elderly away from water, alert neighbours, stay tuned to NIHSA.
+- CRITICAL/EXTREME: Immediate danger. Tell user: EVACUATE NOW, do not walk or drive through flood water (15cm can knock you over, 30cm can move a car), move to highest ground, call emergency services 112, do not touch electrical equipment in flooded areas.
+
+FLOOD SAFETY GUIDELINES TO GIVE WHEN RELEVANT:
+- Do NOT attempt to cross flooded roads — most flood deaths happen this way
+- Do NOT touch electrical appliances or wires in water — electrocution risk
+- Move to highest ground available — upper floors, hills, elevated areas
+- Store clean water and food for at least 3 days
+- Keep important documents (ID, insurance) in a waterproof bag
+- Listen for NIHSA emergency broadcasts on radio
+- Help neighbours, especially elderly and children
+- After flooding: do not eat food that touched floodwater, boil drinking water
 
 RESPONSE STYLE:
-- Be direct, concise, and actionable — this is an emergency platform
+- ALWAYS be direct and actionable — never vague
+- Lead with the most urgent safety action for the user's situation
+- Then give supporting guidelines and context
 - Use simple language accessible to citizens with varying literacy
-- For life-threatening situations, ALWAYS lead with the safety action first
-- Support Hausa, Yoruba, Igbo, and French — detect and respond in the user's language
-- For Nigerian place names, use local pronunciations and common spellings
 - Never provide medical advice — refer to emergency services for injuries
-- Cite NIHSA data sources when discussing forecasts or gauge readings
+- Support Hausa, Yoruba, Igbo, and French — detect and respond in the user's language
 
 APP FEATURES YOU CAN REFERENCE:
 - 🗺️ Map tab: Live gauge stations, alerts, citizen reports
-- 📊 Dashboard: AFO 2026 exposure data (communities, population, health, schools, farmland, roads)
-- 🦺 Vanguard: Flood Marshals coordination network (verified personnel only)
+- 📊 Dashboard: AFO 2026 exposure data
+- 🦺 Vanguard: Flood Marshals coordination network
 - 🔔 Alerts tab: All active flood warnings by state
-- 🚨 Report Flood button: Submit photo/voice/video evidence of active flooding
+- 🚨 Report Flood button: Submit photo/voice/video of flooding
 - Language selector: English, Hausa, Yoruba, Igbo, French
 """
 
@@ -320,84 +346,92 @@ async def detect_language_deepseek(text: str) -> str:
         return "en"
 
 # ============================================================================
-# STT — Cloudflare Whisper Large v3 Turbo
-# IMPROVEMENTS:
-#   1. Hydrology context prompt injected to guide transcription
-#   2. VAD (voice activity detection) enabled to skip silence
-#   3. beam_count=5 for better accuracy
-#   4. condition_on_previous_text=False to prevent hallucination loops
+# STT — Cloudflare Whisper Large v3 Turbo via Worker proxy
+#
+# Root cause of the 500 error:
+#   The original Worker read request.arrayBuffer() (raw binary).
+#   Our wrapper was sending json=payload (JSON body) → Worker got garbage bytes.
+#
+# Fix:
+#   Updated Worker now accepts Content-Type: application/json and forwards all
+#   Whisper hyperparameters to the AI binding. Python sends JSON, not raw bytes.
+#
+# Advanced params we now use:
+#   initial_prompt (→ prompt in Worker)        : hydrology context for better accuracy
+#   vad_filter                                 : strip silence / reduce hallucinations  
+#   num_beams (beam_count in our API)          : 5 beams → better multilingual accuracy
+#   condition_on_previous_text=False           : prevent repetition loops
 # ============================================================================
 
-# Flood/hydrology context prompt for Whisper — dramatically improves accuracy
-# for domain-specific terms like river names, gauge levels, place names
 WHISPER_HYDROLOGY_PROMPT = (
     "NIHSA flood report. Nigeria hydrology. "
-    "Rivers: Niger, Benue, Kaduna, Ogun, Anambra. "
+    "Rivers: Niger, Benue, Kaduna, Ogun, Anambra, Sokoto, Cross River. "
     "Terms: flood, ambaliya, iṣan-omi, mmiri ozuzo, inondation, "
     "gauge, water level, evacuation, alert, NIHSA, NFFS, basin, "
-    "Lokoja, Makurdi, Onitsha, Kano, Lagos, Abuja, Ibadan."
+    "Lokoja, Makurdi, Onitsha, Kano, Lagos, Abuja, Ibadan, Maiduguri."
 )
 
 async def transcribe_audio_cloudflare(audio_data: bytes) -> Tuple[str, str, Optional[float]]:
     """
-    Transcribe audio using Cloudflare Whisper via the Worker proxy.
-    
-    Improvements over baseline:
-    - Sends a hydrology context prompt so Whisper recognises domain terms
-    - Enables VAD to strip silence / background noise  
-    - Uses beam_count=5 for improved multilingual accuracy
-    - Sets condition_on_previous_text=False to prevent hallucination
+    Transcribe audio via the updated Cloudflare Worker (JSON mode).
+
+    The Worker accepts:
+      { audio: <base64>, initial_prompt, vad_filter, beam_count, condition_on_previous_text }
+    and returns:
+      { success, text, language, detected_language, confidence }
     """
     audio_b64 = base64.b64encode(audio_data).decode("utf-8")
 
     payload = {
         "audio": audio_b64,
         "task": "transcribe",
-        "vad_filter": True,                  # Strip silence — reduces hallucination
-        "condition_on_previous_text": False, # Prevent looping hallucinations
-        "beam_count": 5,                     # Better accuracy (default is 1)
-        "initial_prompt": WHISPER_HYDROLOGY_PROMPT,  # Domain context
+        "initial_prompt": WHISPER_HYDROLOGY_PROMPT,
+        "vad_filter": True,
+        "beam_count": 5,
+        "condition_on_previous_text": False,
     }
 
     try:
         async with httpx.AsyncClient(timeout=45) as client:
             resp = await client.post(
                 CLOUDFLARE_WORKER_URL,
-                json=payload,
+                json=payload,                          # JSON body — Worker now accepts this
                 headers={"Content-Type": "application/json"},
             )
-            if resp.status_code != 200:
-                raise HTTPException(
-                    status_code=resp.status_code,
-                    detail=f"Cloudflare STT error: {resp.text[:200]}"
-                )
-            data = resp.json()
 
-        # Extract from Cloudflare response format
-        result = data.get("result", data)
-        text = (
-            result.get("text") or
-            result.get("transcription") or
-            ""
-        ).strip()
+        if resp.status_code != 200:
+            err_text = resp.text[:200]
+            logger.error(f"Worker STT {resp.status_code}: {err_text}")
+            raise HTTPException(
+                status_code=502,
+                detail=f"Speech recognition error ({resp.status_code}). Please try again."
+            )
 
+        data = resp.json()
+
+        if not data.get("success", True):
+            logger.error(f"Worker returned error: {data.get('error')}")
+            raise HTTPException(status_code=502, detail="Transcription failed on the AI side.")
+
+        text = (data.get("text") or "").strip()
         detected_lang = (
-            result.get("detected_language") or
-            result.get("language") or
+            data.get("detected_language") or
+            data.get("language") or
             "en"
         )
-        confidence: Optional[float] = result.get("confidence") or result.get("avg_logprob")
+        confidence: Optional[float] = data.get("confidence")
 
-        # Clean up common Whisper artifacts
-        if text in ("[BLANK_AUDIO]", "[SILENCE]", "(silence)", ""):
+        # Strip common Whisper no-speech artifacts
+        if text.lower() in ("[blank_audio]", "[silence]", "(silence)", ""):
             return "", detected_lang, 0.0
 
+        logger.info(f"✅ Transcription ({detected_lang}): '{text[:80]}'")
         return text, detected_lang, confidence
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Cloudflare STT error: {e}")
+        logger.error(f"STT error: {e}")
         raise HTTPException(status_code=503, detail="Speech recognition temporarily unavailable.")
 
 # ============================================================================
@@ -1182,12 +1216,38 @@ async def chat_endpoint(request: Request, body: ChatRequest):
         lng = loc.get("lng")
         address = loc.get("address", "")
         coords = f"{lat:.4f}°N, {lng:.4f}°E" if lat and lng else "unknown"
+
+        # Determine which active alerts (if any) match this user's state
+        nearby_alerts = []
+        if body.active_alerts:
+            user_state = address.split(",")[-1].strip().lower() if address else ""
+            for a in body.active_alerts:
+                alert_state = (a.get("state") or "").lower()
+                if user_state and (user_state in alert_state or alert_state in user_state):
+                    nearby_alerts.append(a)
+
+        nearby_str = ""
+        if nearby_alerts:
+            nearby_str = f"\nALERTS IN USER'S STATE ({address.split(',')[-1].strip() if address else 'their area'}):\n"
+            for a in nearby_alerts[:4]:
+                nearby_str += f"  🔴 [{a.get('level','')}] {a.get('title','')} — LGAs: {', '.join((a.get('lgas') or [])[:4])}\n"
+        else:
+            nearby_str = f"\nNo active NIHSA alerts currently in {address.split(',')[-1].strip() if address else 'their state'}."
+
         location_context = (
-            f"\nUSER'S CURRENT LOCATION: {address} ({coords})\n"
-            f"CRITICAL INSTRUCTION: Tailor all flood risk information specifically to this location. "
-            f"Check if any of the active alerts above affect this state or its LGAs. "
-            f"If alerts exist near the user's location, lead with that information immediately. "
-            f"If no nearby alerts, say so clearly and advise on seasonal risk for their region of Nigeria."
+            f"\n{'='*50}\n"
+            f"USER'S CURRENT LOCATION (GPS-verified, do NOT ask them for location):\n"
+            f"  Address: {address}\n"
+            f"  Coordinates: {coords}\n"
+            f"{nearby_str}\n"
+            f"ABSOLUTE RULE: NEVER ask the user to provide, share, or confirm their location.\n"
+            f"You already have it above. Use it immediately when answering any location-based question.\n"
+            f"{'='*50}"
+        )
+    else:
+        location_context = (
+            "\nUSER LOCATION: Not yet available (GPS still loading or permission denied). "
+            "If they ask about their area, ask them to name their state or LGA so you can check alerts for them."
         )
 
     system_prompt = get_system_prompt(language)
@@ -1226,7 +1286,71 @@ async def chat_endpoint(request: Request, body: ChatRequest):
                 "type": tool_call.function.name,
                 "params": json.loads(tool_call.function.arguments)
             }
-            reply = "Let me help you with that."
+            # Generate a real, helpful reply alongside the action.
+            # We ask DeepSeek to produce the guidelines the user needs PLUS
+            # acknowledge the action being taken — no more "Let me help with that."
+            tool_name = tool_call.function.name
+            tool_params = json.loads(tool_call.function.arguments)
+
+            # Build a context-aware follow-up prompt
+            action_context = {
+                "navigate_to_report": (
+                    "The user wants to report flooding. "
+                    "Tell them you are opening the report form for them. "
+                    "Also give them 3–4 immediate safety guidelines for their current situation "
+                    "based on their location and any active alerts."
+                ),
+                "escalate_to_human": (
+                    "The user needs human assistance. "
+                    "Tell them you are opening the report form so NIHSA coordinators can see their situation. "
+                    "Critically, give them the most important flood safety guidelines RIGHT NOW while they wait — "
+                    "what to do, what NOT to do, where to go. Be specific to their location and any active alerts."
+                ),
+                "get_flood_status": (
+                    f"The user is asking about flood conditions at: {tool_params.get('location', 'their area')}. "
+                    "Using the active alerts and location data in your context, give them a direct, specific answer. "
+                    "State the current risk level, any active alerts for that area, and what actions they should take."
+                ),
+                "show_tutorial": (
+                    f"You are opening the {tool_params.get('topic', 'general')} tutorial. "
+                    "Give a one-sentence description of what they will learn, then open it."
+                ),
+                "navigate_to_tab": (
+                    f"You are navigating to the {tool_params.get('tab', '')} tab. "
+                    "Give one sentence explaining what they will find there."
+                ),
+                "search_location": (
+                    f"You are searching the map for: {tool_params.get('query', '')}. "
+                    "Tell them you are showing it on the map and give any relevant flood risk info for that area."
+                ),
+            }.get(tool_name, "Give the user helpful flood safety guidance relevant to their request and location.")
+
+            try:
+                follow_up = await deepseek_client.chat.completions.create(
+                    model="deepseek-chat",
+                    messages=[
+                        {"role": "system", "content": full_system},
+                        *[{"role": m.role, "content": m.content} for m in body.messages[-6:]],
+                        {"role": "system", "content": (
+                            f"INSTRUCTION FOR THIS REPLY ONLY: {action_context} "
+                            "Keep your response under 120 words. Be direct and actionable. "
+                            "Do NOT say 'Let me help' or 'I will help'. Start with the actual content."
+                        )},
+                    ],
+                    max_tokens=200,
+                    temperature=0.4,
+                )
+                reply = follow_up.choices[0].message.content or "Opening that for you now."
+            except Exception:
+                # Fallback per tool if the second call fails
+                reply = {
+                    "navigate_to_report": "🚨 Opening the flood report form. Please attach a photo, voice note, or video of the flooding so NIHSA coordinators can verify and respond.",
+                    "escalate_to_human": "🆘 Opening the report form for NIHSA review. While you wait: move to higher ground, do not cross flooded water, call 112 for life-threatening emergencies.",
+                    "get_flood_status": f"Checking flood conditions for {tool_params.get('location', 'your area')} — see the map for live gauge readings.",
+                    "show_tutorial": f"Opening the {tool_params.get('topic', '')} guide for you.",
+                    "navigate_to_tab": f"Taking you to the {tool_params.get('tab', '')} tab.",
+                    "search_location": f"Showing {tool_params.get('query', '')} on the map.",
+                }.get(tool_name, "Done — please check the screen for the result.")
         else:
             reply = message.content or "I'm here to help with flood safety. Please ask a hydrology-related question."
 
