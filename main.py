@@ -44,7 +44,7 @@ CLOUDFLARE_API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "")
 if not CLOUDFLARE_API_TOKEN:
     raise ValueError("CLOUDFLARE_API_TOKEN not set!")
 
-CLOUDFLARE_WORKER_URL = nihsa-whisper-proxy.jonathankaleme.workers.dev
+CLOUDFLARE_WORKER_URL = "nihsa-whisper-proxy.jonathankaleme.workers.dev"
 
 NIHSA_API_URL = os.environ.get("NIHSA_API_URL", "https://nihsa-backend-20hh.onrender.com/api")
 ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS",
