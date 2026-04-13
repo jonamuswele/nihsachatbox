@@ -742,21 +742,24 @@ def detect_language_keywords(text: str) -> str:
 
 async def transcribe_audio_cloudflare(audio_data: bytes) -> Tuple[str, str, float]:
     """
-    Transcribe audio using Cloudflare Worker (which calls Whisper).
+    Transcribe audio using Cloudflare API directly with base64.
     """
+    import base64
+    
     logger.info(f"Received audio: {len(audio_data)} bytes")
     
-    # Detect format for debugging
-    if len(audio_data) >= 4 and audio_data[:4] == b'\x1aE\xdf\xa3':
-        logger.info("Detected WebM/Matroska format")
+    # Convert to base64 string
+    audio_base64 = base64.b64encode(audio_data).decode('utf-8')
     
     try:
-        # Send raw audio to the Worker
         response = await http_client.post(
-            CLOUDFLARE_WORKER_URL,
-            content=audio_data,  # Send raw bytes, not JSON
+            f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/@cf/openai/whisper",
             headers={
-                "Content-Type": "audio/webm",  # Match the format from frontend
+                "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "audio": audio_base64
             },
             timeout=60.0
         )
