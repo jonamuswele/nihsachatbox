@@ -98,13 +98,13 @@ class TutorialResponse(BaseModel):
 # ============================================================================
 
 QUOTA_LIMITS = {
-    "citizen":     7,
-    "vanguard":    7,
-    "researcher":  7,
-    "government":  7,
-    "nihsa_staff": 7,
-    "sub_admin":   7,
-    "admin":       100,
+    "citizen":     5,
+    "vanguard":    10,
+    "researcher":  20,
+    "government":  20,
+    "nihsa_staff": 50,
+    "sub_admin":   50,
+    "admin":       999,
 }
 
 # Rate limiting stays in-memory (per-minute window, resets are fine)
@@ -335,7 +335,15 @@ YOUR SOLE PURPOSE is flood safety, hydrology, and emergency response for Nigeria
 - Historical flood events in Nigeria
 - Climate and seasonal flood outlook (AFO 2026)
 
-REFUSAL RULE: If asked anything unrelated to hydrology, floods, water safety, or Nigerian emergency management, respond: "I'm only able to help with flood safety and hydrology topics. For other questions, please use a general-purpose assistant."
+NON-FLOOD EMERGENCIES:
+If a user reports a fire, accident, medical emergency, robbery, landslide, or any non-flood crisis:
+- Give immediate safety advice relevant to that emergency
+- Call emergency services: 112 (general), 199 (fire), 123 (police) in Nigeria
+- Tell them you are logging their location with NIHSA coordinators who can escalate
+- Ask them to tap the 🚨 Report Flood button and record a short VIDEO of their situation so NIHSA and emergency responders can see it and respond faster
+- Do NOT refuse to help just because it is not a flood — human safety comes first
+
+
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 CRITICAL INSTRUCTION — LOCATION:
