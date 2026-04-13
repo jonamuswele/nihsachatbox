@@ -1,12 +1,4 @@
 #!/usr/bin/env python3
-"""
-NIHSA AI Assistant Wrapper Service
-Production-grade FastAPI service with:
-  - Cloudflare Whisper STT (whisper-large-v3-turbo) with hydrology context prompting
-  - DeepSeek chat with rich NIHSA system prompt
-  - Cloudflare MeloTTS (replaces Google TTS — no credentials needed)
-Optimised for Render deployment.
-"""
 
 import os
 import sys
@@ -97,45 +89,158 @@ class TutorialResponse(BaseModel):
     language: str
 
 # ============================================================================
-# QUOTA SYSTEM
+# QUOTA SYSTEM — PostgreSQL-backed (survives server restarts)
+#
+# Uses the same DATABASE_URL as the main NIHSA backend.
+# Table `ai_usage` is created automatically on startup if it doesn't exist.
+# Each row = one user's daily usage. Rows for past dates are ignored (act as 0).
+# A daily cleanup job removes rows older than 7 days to keep the table small.
 # ============================================================================
 
 QUOTA_LIMITS = {
     "citizen":     5,
-    "vanguard":    7,
-    "researcher":  7,
-    "government":  7,
-    "nihsa_staff": 7,
-    "sub_admin":   7,
-    "admin":       100,
+    "vanguard":    10,
+    "researcher":  20,
+    "government":  20,
+    "nihsa_staff": 50,
+    "sub_admin":   50,
+    "admin":       999,
 }
 
-_usage_store: Dict[str, Dict] = defaultdict(lambda: {"count": 0, "date": None})
-_rate_store:  Dict[str, List[float]] = defaultdict(list)
+# Rate limiting stays in-memory (per-minute window, resets are fine)
+_rate_store: Dict[str, List[float]] = defaultdict(list)
+
+# Optional in-memory cache to reduce DB hits (30-second TTL per user)
+_quota_cache: TTLCache = TTLCache(maxsize=1000, ttl=30)
+
+# ── Database connection ────────────────────────────────────────────────────────
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+_db_pool = None  # asyncpg connection pool, initialised on startup
+
+async def init_db_pool():
+    """Create the asyncpg connection pool and ensure the ai_usage table exists."""
+    global _db_pool
+    if not DATABASE_URL:
+        logger.warning("DATABASE_URL not set — quota will fall back to in-memory (not persistent)")
+        return
+    try:
+        import asyncpg
+        _db_pool = await asyncpg.create_pool(
+            DATABASE_URL,
+            min_size=1,
+            max_size=5,
+            command_timeout=10,
+        )
+        async with _db_pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS ai_usage (
+                    user_id   TEXT        NOT NULL,
+                    usage_date DATE        NOT NULL DEFAULT CURRENT_DATE,
+                    count     INTEGER     NOT NULL DEFAULT 0,
+                    PRIMARY KEY (user_id, usage_date)
+                )
+            """)
+            # Index for fast daily cleanup
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS ai_usage_date_idx ON ai_usage (usage_date)
+            """)
+        logger.info("✅ AI quota DB pool ready — ai_usage table confirmed")
+    except Exception as e:
+        logger.error(f"DB pool init failed: {e} — falling back to in-memory quota")
+        _db_pool = None
+
+async def close_db_pool():
+    global _db_pool
+    if _db_pool:
+        await _db_pool.close()
+        _db_pool = None
+
+async def _cleanup_old_usage():
+    """Delete usage rows older than 7 days — runs once on startup."""
+    if not _db_pool:
+        return
+    try:
+        async with _db_pool.acquire() as conn:
+            deleted = await conn.execute(
+                "DELETE FROM ai_usage WHERE usage_date < CURRENT_DATE - INTERVAL '7 days'"
+            )
+        logger.info(f"Quota cleanup: {deleted}")
+    except Exception as e:
+        logger.warning(f"Quota cleanup failed: {e}")
+
+# ── Fallback in-memory store (used when DB is unavailable) ────────────────────
+_mem_usage: Dict[str, Dict] = defaultdict(lambda: {"count": 0, "date": None})
 
 def get_user_quota(user_data: dict) -> Tuple[int, str]:
     role = (user_data.get("role") or "citizen").lower()
     return QUOTA_LIMITS.get(role, 5), role
 
-def check_daily_quota(user_id: str, role: str) -> Tuple[bool, int, int]:
+async def check_daily_quota(user_id: str, role: str) -> Tuple[bool, int, int]:
+    """Returns (allowed, remaining, limit). Persistent via DB, falls back to memory."""
     limit = QUOTA_LIMITS.get(role, 5)
+
+    # Check in-memory cache first (avoids a DB hit on every message)
+    cache_key = f"quota:{user_id}"
+    if cache_key in _quota_cache:
+        count = _quota_cache[cache_key]
+        remaining = max(0, limit - count)
+        return remaining > 0, remaining, limit
+
+    if _db_pool:
+        try:
+            async with _db_pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT count FROM ai_usage WHERE user_id=$1 AND usage_date=CURRENT_DATE",
+                    user_id
+                )
+            count = row["count"] if row else 0
+            _quota_cache[cache_key] = count
+            remaining = max(0, limit - count)
+            return remaining > 0, remaining, limit
+        except Exception as e:
+            logger.warning(f"DB quota check failed for {user_id}: {e} — using memory fallback")
+
+    # Memory fallback
     today = datetime.now().date().isoformat()
-    store = _usage_store[user_id]
+    store = _mem_usage[user_id]
     if store["date"] != today:
         store["count"] = 0
         store["date"] = today
-    remaining = limit - store["count"]
+    remaining = max(0, limit - store["count"])
     return remaining > 0, remaining, limit
 
-def increment_usage(user_id: str, role: str):
+async def increment_usage(user_id: str, role: str):
+    """Increment today's usage count. Persistent via DB, falls back to memory."""
+    # Invalidate cache so next check reads fresh from DB
+    _quota_cache.pop(f"quota:{user_id}", None)
+
+    if _db_pool:
+        try:
+            async with _db_pool.acquire() as conn:
+                # UPSERT: insert row for today or increment existing count
+                await conn.execute("""
+                    INSERT INTO ai_usage (user_id, usage_date, count)
+                    VALUES ($1, CURRENT_DATE, 1)
+                    ON CONFLICT (user_id, usage_date)
+                    DO UPDATE SET count = ai_usage.count + 1
+                """, user_id)
+            return
+        except Exception as e:
+            logger.warning(f"DB usage increment failed for {user_id}: {e} — using memory fallback")
+
+    # Memory fallback
     today = datetime.now().date().isoformat()
-    store = _usage_store[user_id]
+    store = _mem_usage[user_id]
     if store["date"] != today:
         store["count"] = 0
         store["date"] = today
     store["count"] += 1
 
 def check_rate_limit(key: str, limit: int = 20, window: int = 60) -> bool:
+    """Per-minute rate limit — in-memory is fine, resets are acceptable."""
     import time
     now = time.time()
     times = _rate_store[key]
@@ -1082,8 +1187,11 @@ ROLE_LABELS = {
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("NIHSA AI Wrapper starting — Cloudflare STT + MeloTTS")
+    await init_db_pool()
+    await _cleanup_old_usage()
     yield
     logger.info("NIHSA AI Wrapper shutting down")
+    await close_db_pool()
 
 app = FastAPI(
     title="NIHSA AI Assistant Wrapper",
@@ -1163,7 +1271,7 @@ async def chat_endpoint(request: Request, body: ChatRequest):
     user_id = user_data.get("id", body.session_id)
     limit, role = get_user_quota(user_data)
 
-    allowed, remaining, _ = check_daily_quota(user_id, role)
+    allowed, remaining, _ = await check_daily_quota(user_id, role)
     if not allowed:
         raise HTTPException(
             status_code=429,
@@ -1277,7 +1385,7 @@ async def chat_endpoint(request: Request, body: ChatRequest):
         )
 
         message = response.choices[0].message
-        increment_usage(user_id, role)
+        await increment_usage(user_id, role)
 
         action = None
         if message.tool_calls:
@@ -1407,7 +1515,7 @@ async def get_quota(req: Request):
     user_id = user_data.get("id", "unknown")
     role = user_data.get("role", "citizen").lower()
     limit = QUOTA_LIMITS.get(role, 5)
-    allowed, remaining, _ = check_daily_quota(user_id, role)
+    allowed, remaining, _ = await check_daily_quota(user_id, role)
 
     return {
         "remaining": remaining if allowed else 0,
