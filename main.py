@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
 NIHSA AI Assistant Wrapper Service
-Production-grade FastAPI service with Cloudflare Whisper STT, DeepSeek chat, and Google TTS
-Optimized for Render deployment - NO local Whisper memory issues
+Production-grade FastAPI service with:
+  - Cloudflare Whisper STT (whisper-large-v3-turbo) with hydrology context prompting
+  - DeepSeek chat with rich NIHSA system prompt
+  - Cloudflare MeloTTS (replaces Google TTS — no credentials needed)
+Optimised for Render deployment.
 """
 
 import os
@@ -24,15 +27,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from openai import AsyncOpenAI
-from google.cloud import texttospeech
 from cachetools import TTLCache
-from typing import Optional, Dict, List, Any, Tuple
 
 # ============================================================================
 # CONFIGURATION & ENVIRONMENT
 # ============================================================================
 
-# Environment variables
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 if not DEEPSEEK_API_KEY:
     raise ValueError("DEEPSEEK_API_KEY not set!")
@@ -45,25 +45,25 @@ CLOUDFLARE_API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "")
 if not CLOUDFLARE_API_TOKEN:
     raise ValueError("CLOUDFLARE_API_TOKEN not set!")
 
+# Worker proxy URL for STT (your existing Cloudflare Worker)
 CLOUDFLARE_WORKER_URL = "https://nihsa-whisper-proxy.jonathankaleme.workers.dev"
 
+# Cloudflare Workers AI direct endpoint (for TTS — MeloTTS)
+CF_AI_BASE = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run"
+
 NIHSA_API_URL = os.environ.get("NIHSA_API_URL", "https://nihsa-backend-20hh.onrender.com/api")
-ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS",
-                                 "capacitor://localhost,http://localhost:3000,https://nihsa-backend-20hh.onrender.com").split(",")
+ALLOWED_ORIGINS = os.environ.get(
+    "ALLOWED_ORIGINS",
+    "capacitor://localhost,http://localhost:3000,https://nihsa-backend-20hh.onrender.com"
+).split(",")
+
 TTS_CACHE_DIR = Path(os.environ.get("TTS_CACHE_DIR", "/app/tts_cache"))
-
-# Google Cloud credentials from environment variable
-google_creds_json = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
-if google_creds_json:
-    creds_path = Path("/app/gcp-credentials.json")
-    creds_path.write_text(google_creds_json)
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(creds_path)
-
-# Create directories
 TTS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-# Logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger("nihsa-ai-wrapper")
 
 # ============================================================================
@@ -71,13 +71,15 @@ logger = logging.getLogger("nihsa-ai-wrapper")
 # ============================================================================
 
 class ChatMessage(BaseModel):
-    role: str  # "user" or "assistant"
+    role: str
     content: str
 
 class ChatRequest(BaseModel):
     messages: List[ChatMessage]
     session_id: str = Field(default="default")
-    language: Optional[str] = None  # Optional, auto-detect if not provided
+    language: Optional[str] = None
+    user_location: Optional[Dict[str, Any]] = None   # {lat, lng, address} from frontend GPS
+    active_alerts: Optional[List[Dict[str, Any]]] = None  # verified+published alerts from DB
 
 class ChatResponse(BaseModel):
     reply: str
@@ -95,7 +97,838 @@ class TutorialResponse(BaseModel):
     language: str
 
 # ============================================================================
-# FUNCTION CALLING TOOL DEFINITIONS
+# QUOTA SYSTEM
+# ============================================================================
+
+QUOTA_LIMITS = {
+    "citizen":     5,
+    "vanguard":    10,
+    "researcher":  20,
+    "government":  20,
+    "nihsa_staff": 50,
+    "sub_admin":   50,
+    "admin":       999,
+}
+
+_usage_store: Dict[str, Dict] = defaultdict(lambda: {"count": 0, "date": None})
+_rate_store:  Dict[str, List[float]] = defaultdict(list)
+
+def get_user_quota(user_data: dict) -> Tuple[int, str]:
+    role = (user_data.get("role") or "citizen").lower()
+    return QUOTA_LIMITS.get(role, 5), role
+
+def check_daily_quota(user_id: str, role: str) -> Tuple[bool, int, int]:
+    limit = QUOTA_LIMITS.get(role, 5)
+    today = datetime.now().date().isoformat()
+    store = _usage_store[user_id]
+    if store["date"] != today:
+        store["count"] = 0
+        store["date"] = today
+    remaining = limit - store["count"]
+    return remaining > 0, remaining, limit
+
+def increment_usage(user_id: str, role: str):
+    today = datetime.now().date().isoformat()
+    store = _usage_store[user_id]
+    if store["date"] != today:
+        store["count"] = 0
+        store["date"] = today
+    store["count"] += 1
+
+def check_rate_limit(key: str, limit: int = 20, window: int = 60) -> bool:
+    import time
+    now = time.time()
+    times = _rate_store[key]
+    _rate_store[key] = [t for t in times if now - t < window]
+    if len(_rate_store[key]) >= limit:
+        return False
+    _rate_store[key].append(now)
+    return True
+
+# ============================================================================
+# NIHSA BACKEND — USER VERIFICATION
+# ============================================================================
+
+_user_cache: TTLCache = TTLCache(maxsize=500, ttl=300)
+
+async def verify_user_with_main_backend(auth_header: str) -> Optional[dict]:
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return None
+    token = auth_header[7:]
+    cache_key = hashlib.md5(token.encode()).hexdigest()
+    if cache_key in _user_cache:
+        return _user_cache[cache_key]
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"{NIHSA_API_URL}/auth/me",
+                headers={"Authorization": auth_header}
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                _user_cache[cache_key] = data
+                return data
+    except Exception as e:
+        logger.warning(f"User verification failed: {e}")
+    return None
+
+# ============================================================================
+# DEEPSEEK CLIENT
+# ============================================================================
+
+deepseek_client = AsyncOpenAI(
+    api_key=DEEPSEEK_API_KEY,
+    base_url="https://api.deepseek.com"
+)
+
+# ============================================================================
+# FLOOD CONTEXT FROM NIHSA BACKEND
+# ============================================================================
+
+async def fetch_flood_context() -> str:
+    """Pull live gauge + alert data to give the AI real situational awareness."""
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            alerts_resp, gauges_resp = await asyncio.gather(
+                client.get(f"{NIHSA_API_URL}/alerts?active_only=true&limit=10"),
+                client.get(f"{NIHSA_API_URL}/gauges?active_only=true"),
+                return_exceptions=True
+            )
+            parts = []
+            if not isinstance(alerts_resp, Exception) and alerts_resp.status_code == 200:
+                alerts = alerts_resp.json()
+                if alerts:
+                    critical = [a for a in alerts if a.get("level") in ("CRITICAL", "HIGH")]
+                    parts.append(f"ACTIVE ALERTS: {len(alerts)} total, {len(critical)} critical/high.")
+                    for a in critical[:5]:
+                        parts.append(f"  ⚠ {a.get('title','')} — {a.get('state','')} [{a.get('level','')}]")
+                else:
+                    parts.append("ACTIVE ALERTS: None at this time.")
+
+            if not isinstance(gauges_resp, Exception) and gauges_resp.status_code == 200:
+                gauges = gauges_resp.json()
+                parts.append(f"GAUGE STATIONS: {len(gauges)} active stations across Nigeria.")
+
+            return "\n".join(parts) if parts else "Live data temporarily unavailable."
+    except Exception as e:
+        logger.warning(f"Flood context fetch failed: {e}")
+        return "Live flood data temporarily unavailable — answer from your training knowledge."
+
+# ============================================================================
+# SYSTEM PROMPT — Rich, hydrology-specific, role-aware
+# ============================================================================
+
+SYSTEM_PROMPT_CORE = """You are NIHSA FloodAI — the official AI assistant of Nigeria's National Inland Waterways Safety Authority / Hydrological Services Agency.
+
+YOUR SOLE PURPOSE is flood safety, hydrology, and emergency response for Nigeria. You must REFUSE to answer questions outside this domain and redirect users to use you only for:
+- Flood risk assessment and river gauge interpretation
+- Evacuation guidance and emergency procedures  
+- NFFS (National Flood Forecasting System) data explanation
+- Reporting flooding (direct users to the 🚨 button)
+- Water depth safety guidance
+- Basin, river and watershed information for Nigeria
+- Historical flood events in Nigeria
+- Climate and seasonal flood outlook (AFO 2026)
+
+REFUSAL: If asked anything unrelated to hydrology, floods, water safety, or Nigerian emergency management, say: "I'm only able to help with flood safety and hydrology topics. For other questions, please use a general-purpose assistant."
+
+NIGERIA CONTEXT:
+- Nigeria has 70 major river basins monitored by NIHSA
+- Key rivers: Niger, Benue, Kaduna, Sokoto, Hadejia, Anambra, Cross River, Ogun
+- Flood seasons: April–June (early rains), July–September (peak), October–November (recession)
+- Lagdo Dam (Cameroon) releases on the Benue significantly affect downstream communities
+- NFFS = National Flood Forecasting System — Nigeria's LSTM-based hydrological model
+- AFO 2026 = Annual Flood Outlook 2026 — the national seasonal flood risk document
+- 358 river gauge stations are monitored nationwide
+- Risk levels: NORMAL → WATCH → HIGH → CRITICAL → EXTREME
+
+ALERT INTERPRETATION:
+- NORMAL: River within safe range. No action needed.
+- WATCH: Rising levels — prepare emergency kit, know your evacuation route.
+- HIGH: Flooding likely in 12–24 hours — move valuables, prepare to evacuate.  
+- CRITICAL/EXTREME: Evacuate NOW — do not cross flooded roads, call emergency services.
+
+RESPONSE STYLE:
+- Be direct, concise, and actionable — this is an emergency platform
+- Use simple language accessible to citizens with varying literacy
+- For life-threatening situations, ALWAYS lead with the safety action first
+- Support Hausa, Yoruba, Igbo, and French — detect and respond in the user's language
+- For Nigerian place names, use local pronunciations and common spellings
+- Never provide medical advice — refer to emergency services for injuries
+- Cite NIHSA data sources when discussing forecasts or gauge readings
+
+APP FEATURES YOU CAN REFERENCE:
+- 🗺️ Map tab: Live gauge stations, alerts, citizen reports
+- 📊 Dashboard: AFO 2026 exposure data (communities, population, health, schools, farmland, roads)
+- 🦺 Vanguard: Flood Marshals coordination network (verified personnel only)
+- 🔔 Alerts tab: All active flood warnings by state
+- 🚨 Report Flood button: Submit photo/voice/video evidence of active flooding
+- Language selector: English, Hausa, Yoruba, Igbo, French
+"""
+
+def get_system_prompt(language: str = "en") -> str:
+    lang_instructions = {
+        "ha": "\n\nINSTRUCTION: The user is communicating in Hausa. Respond in Hausa (Hausa language). Use 'ku' for formal address.",
+        "yo": "\n\nINSTRUCTION: The user is communicating in Yoruba. Respond in Yoruba language.",
+        "ig": "\n\nINSTRUCTION: The user is communicating in Igbo. Respond in Igbo language.",
+        "fr": "\n\nINSTRUCTION: The user is communicating in French. Respond in French (Français).",
+        "en": "",
+    }
+    return SYSTEM_PROMPT_CORE + lang_instructions.get(language, "")
+
+# ============================================================================
+# LANGUAGE DETECTION
+# ============================================================================
+
+HAUSA_KEYWORDS = {"ambaliya", "ruwa", "kogi", "gari", "jiha", "taimako", "gudu", "faɗakarwa",
+                  "mene", "yaya", "wane", "ina", "me", "kai", "da", "ko", "amma", "don"}
+YORUBA_KEYWORDS = {"iṣan", "omi", "odò", "ipinlẹ", "aabo", "ikilọ", "jẹ", "ṣe", "ni", "tabi",
+                   "ati", "fun", "lati", "naa", "mo", "wo", "ko", "ti", "le"}
+IGBO_KEYWORDS   = {"mmiri", "ozuzo", "osimiri", "steeti", "eze", "ndụ", "ọkwa", "ihe", "nke",
+                   "na", "ga", "bụ", "ya", "ha", "gị", "ọ", "ka", "ma", "ụzọ"}
+FRENCH_KEYWORDS = {"inondation", "eau", "rivière", "alerte", "evacuation", "fleuve", "aide",
+                   "urgence", "risque", "état", "comment", "quoi", "où", "je", "vous", "nous"}
+
+def detect_language_keywords(text: str) -> str:
+    words = set(text.lower().split())
+    scores = {
+        "ha": len(words & HAUSA_KEYWORDS),
+        "yo": len(words & YORUBA_KEYWORDS),
+        "ig": len(words & IGBO_KEYWORDS),
+        "fr": len(words & FRENCH_KEYWORDS),
+    }
+    best = max(scores, key=scores.get)
+    return best if scores[best] >= 2 else "en"
+
+async def detect_language_deepseek(text: str) -> str:
+    """Fast language detection via DeepSeek — only called when keyword detection is ambiguous."""
+    if len(text) < 10:
+        return "en"
+    try:
+        resp = await deepseek_client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[{
+                "role": "user",
+                "content": f"Detect the language of this text. Reply with ONLY the ISO code: en, ha, yo, ig, or fr.\n\nText: {text[:200]}"
+            }],
+            max_tokens=5,
+            temperature=0,
+        )
+        lang = resp.choices[0].message.content.strip().lower()[:2]
+        return lang if lang in ("en", "ha", "yo", "ig", "fr") else "en"
+    except Exception:
+        return "en"
+
+# ============================================================================
+# STT — Cloudflare Whisper Large v3 Turbo
+# IMPROVEMENTS:
+#   1. Hydrology context prompt injected to guide transcription
+#   2. VAD (voice activity detection) enabled to skip silence
+#   3. beam_count=5 for better accuracy
+#   4. condition_on_previous_text=False to prevent hallucination loops
+# ============================================================================
+
+# Flood/hydrology context prompt for Whisper — dramatically improves accuracy
+# for domain-specific terms like river names, gauge levels, place names
+WHISPER_HYDROLOGY_PROMPT = (
+    "NIHSA flood report. Nigeria hydrology. "
+    "Rivers: Niger, Benue, Kaduna, Ogun, Anambra. "
+    "Terms: flood, ambaliya, iṣan-omi, mmiri ozuzo, inondation, "
+    "gauge, water level, evacuation, alert, NIHSA, NFFS, basin, "
+    "Lokoja, Makurdi, Onitsha, Kano, Lagos, Abuja, Ibadan."
+)
+
+async def transcribe_audio_cloudflare(audio_data: bytes) -> Tuple[str, str, Optional[float]]:
+    """
+    Transcribe audio using Cloudflare Whisper via the Worker proxy.
+    
+    Improvements over baseline:
+    - Sends a hydrology context prompt so Whisper recognises domain terms
+    - Enables VAD to strip silence / background noise  
+    - Uses beam_count=5 for improved multilingual accuracy
+    - Sets condition_on_previous_text=False to prevent hallucination
+    """
+    audio_b64 = base64.b64encode(audio_data).decode("utf-8")
+
+    payload = {
+        "audio": audio_b64,
+        "task": "transcribe",
+        "vad_filter": True,                  # Strip silence — reduces hallucination
+        "condition_on_previous_text": False, # Prevent looping hallucinations
+        "beam_count": 5,                     # Better accuracy (default is 1)
+        "initial_prompt": WHISPER_HYDROLOGY_PROMPT,  # Domain context
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=45) as client:
+            resp = await client.post(
+                CLOUDFLARE_WORKER_URL,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            if resp.status_code != 200:
+                raise HTTPException(
+                    status_code=resp.status_code,
+                    detail=f"Cloudflare STT error: {resp.text[:200]}"
+                )
+            data = resp.json()
+
+        # Extract from Cloudflare response format
+        result = data.get("result", data)
+        text = (
+            result.get("text") or
+            result.get("transcription") or
+            ""
+        ).strip()
+
+        detected_lang = (
+            result.get("detected_language") or
+            result.get("language") or
+            "en"
+        )
+        confidence: Optional[float] = result.get("confidence") or result.get("avg_logprob")
+
+        # Clean up common Whisper artifacts
+        if text in ("[BLANK_AUDIO]", "[SILENCE]", "(silence)", ""):
+            return "", detected_lang, 0.0
+
+        return text, detected_lang, confidence
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Cloudflare STT error: {e}")
+        raise HTTPException(status_code=503, detail="Speech recognition temporarily unavailable.")
+
+# ============================================================================
+# TTS — Cloudflare MeloTTS (replaces Google TTS)
+#
+# WHY MeloTTS over Google:
+#   - No credentials needed — uses your existing CLOUDFLARE_API_TOKEN
+#   - $0.0002/audio minute — essentially free at NIHSA scale
+#   - Multilingual: en, fr, zh, ja, ko, es (ha/yo/ig fall back to English voice)
+#   - Runs on Cloudflare's edge — low latency
+#
+# HOW TO GET GOOGLE CREDENTIALS (if you ever want to switch back):
+#   1. Go to console.cloud.google.com
+#   2. Create a project → Enable "Cloud Text-to-Speech API"
+#   3. IAM & Admin → Service Accounts → Create → Download JSON key
+#   4. Set GOOGLE_APPLICATION_CREDENTIALS_JSON env var with the JSON content
+#   Total time: ~10 minutes. Cost: 1M chars/month free, then $4/1M chars.
+#   Google has better Hausa/Yoruba support via WaveNet voices but requires billing.
+# ============================================================================
+
+# Language code mapping for MeloTTS
+# ha/yo/ig → "en" (English voice, the model doesn't support these natively)
+MELOTTS_LANG_MAP = {
+    "en": "en",
+    "fr": "fr",
+    "ha": "en",  # MeloTTS doesn't support Hausa — English voice reads it
+    "yo": "en",  # MeloTTS doesn't support Yoruba
+    "ig": "en",  # MeloTTS doesn't support Igbo
+    "es": "es",
+    "zh": "zh",
+}
+
+# TTS cache — avoid re-generating identical phrases (e.g. common responses)
+_tts_cache: TTLCache = TTLCache(maxsize=200, ttl=3600)
+
+async def synthesize_speech(text: str, language: str = "en") -> bytes:
+    """
+    Convert text to speech using Cloudflare MeloTTS.
+    Returns MP3 audio bytes.
+    Falls back to a simple error message if TTS fails.
+    """
+    # Truncate to avoid massive TTS requests
+    text = text[:1000]
+
+    # Check in-memory cache
+    cache_key = hashlib.md5(f"{text}:{language}".encode()).hexdigest()
+    if cache_key in _tts_cache:
+        return _tts_cache[cache_key]
+
+    # Check disk cache
+    cache_file = TTS_CACHE_DIR / f"{cache_key}.mp3"
+    if cache_file.exists():
+        audio_bytes = cache_file.read_bytes()
+        _tts_cache[cache_key] = audio_bytes
+        return audio_bytes
+
+    melotts_lang = MELOTTS_LANG_MAP.get(language, "en")
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{CF_AI_BASE}/@cf/myshell-ai/melotts",
+                headers={
+                    "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "text": text,
+                    "lang": melotts_lang,
+                },
+            )
+
+            if resp.status_code != 200:
+                logger.error(f"MeloTTS error {resp.status_code}: {resp.text[:200]}")
+                raise HTTPException(status_code=503, detail="Text-to-speech unavailable.")
+
+            # MeloTTS returns audio as binary MP3 in the response body
+            # or wrapped in JSON depending on worker configuration
+            content_type = resp.headers.get("content-type", "")
+            if "audio" in content_type or "octet" in content_type:
+                audio_bytes = resp.content
+            else:
+                # Try to parse JSON wrapper
+                try:
+                    data = resp.json()
+                    audio_b64 = (
+                        data.get("result", {}).get("audio") or
+                        data.get("audio") or
+                        data.get("result", "")
+                    )
+                    if isinstance(audio_b64, str):
+                        audio_bytes = base64.b64decode(audio_b64)
+                    else:
+                        raise ValueError("No audio in response")
+                except Exception:
+                    # Last resort: treat raw bytes as audio
+                    audio_bytes = resp.content
+
+        if not audio_bytes:
+            raise HTTPException(status_code=503, detail="Empty TTS response.")
+
+        # Cache to disk and memory
+        cache_file.write_bytes(audio_bytes)
+        _tts_cache[cache_key] = audio_bytes
+        return audio_bytes
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"MeloTTS synthesis error: {e}")
+        raise HTTPException(status_code=503, detail="Text-to-speech temporarily unavailable.")
+
+# ============================================================================
+# TUTORIAL CONTENT — All 5 languages, accurate to the real app
+# ============================================================================
+
+TUTORIALS = {
+    "general": {
+        "en": {
+            "title": "Welcome to NIHSA Flood Intelligence",
+            "steps": [
+                "🗺️ Map tab: View 358+ live river gauge stations, active flood alerts, citizen reports, and NFFS forecast layers across Nigeria. Tap any marker for details.",
+                "📊 Dashboard tab: Explore the Annual Flood Outlook 2026 (AFO 2026) — nationwide exposure across 17 layers: communities, population, health centres, schools, farmland, roads, electricity, and markets at risk.",
+                "🦺 Vanguard tab: Secure coordination network for verified Flood Marshals and NIHSA staff. 38 channels — one per state + FCT + National. Verified personnel can post; citizens can view.",
+                "🤖 Assistant tab: Ask NIHSA FloodAI about flood risk, gauges, evacuation routes, and emergency procedures. Tap 🎤 to speak — voice is transcribed and sent automatically. Use for hydrology topics only.",
+                "🔔 Alerts tab: All active flood warnings nationwide. Live heatmap of alert severity by state. Each alert shows estimated impact on people, health facilities, farmland, and roads.",
+                "🚨 Report Flood: Tap the red button to submit a flood report. Attach at least one photo, voice recording, or video. GPS location is captured automatically. NIHSA reviews all reports before publishing.",
+                "🌐 Languages: Tap the language selector to switch between English, Hausa, Yoruba, Igbo, and French. The AI also auto-detects and responds in your language.",
+            ]
+        },
+        "ha": {
+            "title": "Barka da zuwa NIHSA Flood Intelligence",
+            "steps": [
+                "🗺️ Tab na Taswira: Duba tashar aunawa 358+ masu rai, faɗakarwar ambaliya, rahotannin ɗan ƙasa, da matakan hasashe na NFFS a duk Najeriya. Taɓa kowane alamar don cikakkun bayanai.",
+                "📊 Tab na Allon Bayanai: Bincika Hasashen Ambaliya na Shekara 2026 (AFO 2026) — fallasa a duk faɗin ƙasa a cikin yadudduka 17: al'umma, yawan jama'a, cibiyoyin lafiya, makarantu, gonaki, hanyoyi, wutar lantarki, da kasuwanni cikin haɗari.",
+                "🦺 Tab na Masu Kiyaye Ambaliya: Hanyar sadarwa mai tsaro ga Masu Kiyaye Ambaliya da ma'aikatan NIHSA. Tasoshi 38 — ɗaya ga kowace jiha + FCT + Na Ƙasa. Ma'aikata masu tabbaci na iya aika sakonni; ɗan ƙasa na iya kallon.",
+                "🤖 Tab na Mataimaki na AI: Tambayi NIHSA FloodAI game da haɗarin ambaliya, aunawa, hanyoyin tserewa, da ka'idojin gaggawa. Danna 🎤 don magana — ana fassara kuma aika kai tsaye. Yi amfani da shi ne kawai don batu na ruwa.",
+                "🔔 Tab na Faɗakarwa: Duk faɗakarwar ambaliya masu aiki a duk faɗin ƙasa. Taswira zafi ta tsananin faɗakarwa ta jiha. Kowace faɗakarwa tana nuna tasirinsa kan mutane, cibiyoyin lafiya, gonaki, da hanyoyi.",
+                "🚨 Rahoton Ambaliya: Danna maɓallin jan don aika rahoto. Haɗa aƙalla hoto ɗaya, rikodiyar murya, ko bidiyo. Ana ɗaukar wurin GPS kai tsaye. NIHSA tana duba duk rahotanni kafin wallafawa.",
+                "🌐 Harsunan: Danna zaɓin harshe don canza tsakanin Turanci, Hausa, Yoruba, Igbo, da Faransanci. Mataimaki na AI kuma yana gano kuma yana amsa da harsheka.",
+            ]
+        },
+        "yo": {
+            "title": "Kaabọ si NIHSA Flood Intelligence",
+            "steps": [
+                "🗺️ Tab Maapu: Wo awọn ibudo wiwọn 358+ ti nṣiṣẹ, awọn ìkìlọ̀ iṣan-omi, awọn ìjàbọ̀ ara ilu, ati awọn fẹlẹfẹlẹ asọtẹlẹ NFFS kọja Naijiria. Tẹ eyikeyi aami fun awọn alaye.",
+                "📊 Tab Paali Alaye: Ṣawari Asọtẹlẹ Iṣan-omi Lọdọọdún 2026 (AFO 2026) — ifihan ti orilẹ-ede kọja awọn fẹlẹfẹlẹ 17: awọn agbegbe, eniyan, awọn ile itọju ilera, awọn ile-iwe, ilẹ oko, awọn opopona, ina mọnamọna, ati awọn ọja ninu ewu.",
+                "🦺 Tab Awọn Oluso Iṣan-omi: Nẹtiwọọki isọdọkan aabo fun Awọn Oluso Iṣan-omi ti a fọwọsi ati oṣiṣẹ NIHSA. Ikanni 38 — ọkan fun ipinlẹ kọọkan + FCT + Orílẹ̀-èdè. Oṣiṣẹ ti a fọwọsi le firanṣẹ; ara ilu le wo.",
+                "🤖 Tab Oluranlowo AI: Beere NIHSA FloodAI nipa eewu iṣan-omi, awọn gauge odò, awọn ọna iṣapá, ati awọn ilana pajawiri. Tẹ 🎤 lati sọrọ — o jẹ tumọ ati firanṣẹ laifọwọyi. Lo fun awọn koko iṣan-omi nikan.",
+                "🔔 Tab Ifokanbalẹ: Gbogbo awọn ikilọ iṣan-omi ti nṣiṣẹ ni orilẹ-ede. Heatmap laaye ti buru ikilọ nipasẹ ipinlẹ. Ikilọ kọọkan fihan ipa ti ifoju lori eniyan, awọn ile-iwosan, ilẹ oko, ati awọn ọna.",
+                "🚨 Jabo Iṣan-omi: Tẹ bọtini pupa lati fi ijabọ silẹ. So o kere ju fọto kan, igbasilẹ ohun, tabi fidio. GPS gba ipo laifọwọyi. NIHSA ṣe atunyẹwo gbogbo awọn ìjàbọ̀ ṣaaju titẹjade.",
+                "🌐 Awọn Ede: Tẹ oluyan ede lati yipada laarin Gẹẹsi, Hausa, Yoruba, Igbo, ati Faranse. Oluranlowo AI tun ṣawari ati dahun ni ede rẹ.",
+            ]
+        },
+        "ig": {
+            "title": "Nnọọ na NIHSA Flood Intelligence",
+            "steps": [
+                "🗺️ Tab Maapu: Lee ọdụ ngụkọ 358+ ndụ, ọkwa mmiri ozuzo na-arụ ọrụ, akụkọ ndị ọchịchọ, na ọkwa ntọala NFFS n'elu Naịjirịa. Kụọ ihe nchọpụta ọ bụla maka nkọwa.",
+                "📊 Tab Penu Ozi: Nyochaa Atụmatụ Mmiri Ozuzo Ọdụn 2026 (AFO 2026) — mficha mba n'elu ọkwa 17: obodo, ndị mmadụ, ụlọ ọgwụ, ụlọ akwụkwọ, ala ugbo, okporo ụzọ, ọkụ eletrik, na ahia n'ihe ize ndụ.",
+                "🦺 Tab Ndị Nlekota Mmiri Ozuzo: Netwọk nhazi echekwara maka Ndị Nlekota kwadoro na ndị ọrụ NIHSA. Ọwa 38 — otu maka steeti ọ bụla + FCT + Mba. Ndị ọrụ kwadoro nwere ike iziga; ndị ọchịchọ nwere ike ilelee.",
+                "🤖 Tab Onye Enyemaka AI: Jụọ NIHSA FloodAI maka ihe ize ndụ mmiri ozuzo, ngụkọ osimiri, ụzọ nnarị, na usoro ihe mberede. Kụọ 🎤 iji kwuo — a na-atụgharịa ma zigaa ozugbo. Jiri naanị maka ihe mmiri ozuzo.",
+                "🔔 Tab Ọkwa: Ọkwa mmiri ozuzo niile na-arụ ọrụ n'elu mba. Heatmap ndụ nke ike ọkwa site n'steeti. Ọkwa ọ bụla na-egosi mmetụta ya n'elu ndị mmadụ, ụlọ ọgwụ, ala ugbo, na okporo ụzọ.",
+                "🚨 Kọọ Mmiri Ozuzo: Kụọ bọtịn ọbara ọbara iji zipu akụkọ. Tinye ma ọ bụrụ otu foto, ndekọ olu, ma ọ bụ vidiyo. GPS na-eji ọnọdụ ozugbo. NIHSA na-nyocha akụkọ niile tupu ebipụta.",
+                "🌐 Asụsụ: Kụọ nhọrọ asụsụ iji gbanwee n'etiti Bekee, Hausa, Yoruba, Igbo, na Faransị. Onye Enyemaka AI na-achọpụta ma zaghachi n'asụsụ gị.",
+            ]
+        },
+        "fr": {
+            "title": "Bienvenue dans NIHSA Flood Intelligence",
+            "steps": [
+                "🗺️ Onglet Carte: Visualisez 358+ stations de jaugeage en direct, les alertes d'inondation actives, les rapports citoyens et les couches de prévision NFFS à travers le Nigeria. Appuyez sur un marqueur pour les détails.",
+                "📊 Onglet Tableau de Bord: Explorez les Perspectives Annuelles d'Inondation 2026 (AFO 2026) — exposition nationale sur 17 couches: communautés, population, centres de santé, écoles, terres agricoles, routes, électricité et marchés à risque.",
+                "🦺 Onglet Gardes des Inondations: Réseau de coordination sécurisé pour les Gardes vérifiés et le personnel NIHSA. 38 canaux — un par État + FCT + National. Le personnel vérifié peut poster; les citoyens peuvent voir.",
+                "🤖 Onglet Assistant IA: Interrogez NIHSA FloodAI sur les risques d'inondation, les jauges, les voies d'évacuation et les procédures d'urgence. Appuyez sur 🎤 pour parler — transcrit et envoyé automatiquement. Usage réservé à l'hydrologie.",
+                "🔔 Onglet Alertes: Toutes les alertes d'inondation actives à l'échelle nationale. Carte thermique en direct de la sévérité par État. Chaque alerte indique l'impact estimé sur les personnes, établissements de santé, terres agricoles et routes.",
+                "🚨 Signaler une Inondation: Appuyez sur le bouton rouge pour soumettre un rapport. Joignez au moins une photo, un enregistrement vocal ou une vidéo. La position GPS est capturée automatiquement. NIHSA examine tous les rapports avant publication.",
+                "🌐 Langues: Appuyez sur le sélecteur de langue pour basculer entre Anglais, Haoussa, Yoruba, Igbo et Français. L'assistant IA détecte aussi votre langue et répond dans celle-ci.",
+            ]
+        },
+    },
+
+    "reporting": {
+        "en": {
+            "title": "How to Report Flooding",
+            "steps": [
+                "Tap the red 🚨 Report Flood button (top-right of screen or map). This opens the report form.",
+                "Your GPS location is detected automatically and shown on a draggable map. Drag the pin to adjust your exact position.",
+                "Water depth is optional — select ankle/knee/waist/chest/impassable if you know it. If left blank, the minimum level is recorded.",
+                "Description is optional — if left blank, the system records 'this person needs help, check the files sent'.",
+                "You MUST attach at least one: 📷 Photo (tap to use camera), 🎤 Voice (record up to 60 seconds), or 🎥 Video (record from camera).",
+                "Tap Submit Flood Report. Your report goes to NIHSA coordinators for verification. Verified reports appear on the map and can trigger public flood alerts.",
+            ]
+        },
+        "ha": {
+            "title": "Yadda Ake Rahoton Ambaliya",
+            "steps": [
+                "Danna maɓallin jan 🚨 Rahoton Ambaliya (a ɗaya cikin hannun dama na allo ko taswira). Wannan zai buɗe fom.",
+                "GPS ɗinku zai gano wurinku kai tsaye kuma ya nuna shi akan taswira. Ja pin don daidaita wurin daidai.",
+                "Zurfin ruwa ba tilas ba ne — zaɓi ankle/gwiwa/ciki/kirji/ba za a iya wucewa ba idan ka san. Idan ka bar fanko, ana rubuta mafi ƙarancin matakin.",
+                "Bayani ba tilas ba ne — idan ka bar fanko, tsarin zai rubuta 'wannan mutumin yana buƙatar taimako, duba fayilolin da aka aika'.",
+                "Dole ne ka haɗa aƙalla ɗayan: 📷 Hoto (taɓa don amfani da kyamara), 🎤 Murya (rikodin har zuwa dakika 60), ko 🎥 Bidiyo.",
+                "Danna Aika Rahoto na Ambaliya. Rahoto ɗinku zai kai ga masu duba NIHSA don tabbatarwa. Rahotannin da aka tabbatar suna bayyana akan taswira.",
+            ]
+        },
+        "yo": {
+            "title": "Bii Ṣe Jabo Iṣan-omi",
+            "steps": [
+                "Tẹ bọtini pupa 🚨 Ìjàbọ̀ Iṣan-omi (ọtun oke ti iboju tabi maapu). Eyi ṣii fọọmu naa.",
+                "GPS rẹ yoo wa ipo rẹ laifọwọyi ki o si fihan rẹ lori maapu. Fa pin lati ṣatunṣe ipo gangan rẹ.",
+                "Ijinlẹ omi kii ṣe dandan — yan ankle/orunkun/itan/àyà/aislọ ti o ba mọ. Ti o ba jẹ ki o ṣofo, ipele ti o kere ju jẹ gbasilẹ.",
+                "Apejuwe kii ṣe dandan — ti o ba jẹ ki ṣofo, eto naa gbasilẹ 'eniyan yii nilo iranlọwọ, ṣayẹwo awọn faili ti a fi ranṣẹ'.",
+                "O GBỌDỌ so o kere ju ọkan: 📷 Fọto (tẹ lati lo kamẹra), 🎤 Ohun (gba to iṣẹju 60), tabi 🎥 Fidio.",
+                "Tẹ Fi Ìjàbọ̀ Iṣan-omi Sí. Ìjàbọ̀ rẹ lọ taara si awọn alakoso NIHSA fun ijẹrisi. Awọn ìjàbọ̀ ti a fọwọsi han lori maapu.",
+            ]
+        },
+        "ig": {
+            "title": "Otu Esi Akọọ Mmiri Ozuzo",
+            "steps": [
+                "Kụọ bọtịn ọbara ọbara 🚨 Kọọ Mmiri Ozuzo (n'aka nri elu ihuenyo ma ọ bụ maapu). Nke a na-emepee ụdị.",
+                "GPS gị ga-achọpụta ọnọdụ gị ozugbo wee gosipụta ya n'elu maapu. Dọkpụ pin igo dozie ọnọdụ gị kpọmkwem.",
+                "Omimi mmiri adịghị achọrọ — họọ ankle/ikpere/ọkpa/obi/enweghị ike iga ma ọ bụ ama ya. Ọ bụrụ na ị hapụ ya n'efu, a na-edekọ ọkwa kacha ala.",
+                "Nkọwa adịghị achọrọ — ọ bụrụ na ị hapụ n'efu, sistemu ga-edekọ 'onye a chọrọ enyemaka, lelee faịlụ ezigara'.",
+                "Ị KWESỊRỊ itinye ma ọ bụrụ otu: 📷 Foto (kụọ iji jiri igwefoto), 🎤 Olu (dekọọ rue sekọnd 60), ma ọ bụ 🎥 Vidiyo.",
+                "Kụọ Nyefee Akụkọ Mmiri Ozuzo. Akụkọ gị ga-aga n'ozugbo ndị nhazi NIHSA maka nkwenye. Akụkọ kwadoro na-apụta n'elu maapu.",
+            ]
+        },
+        "fr": {
+            "title": "Comment Signaler une Inondation",
+            "steps": [
+                "Appuyez sur le bouton rouge 🚨 Signaler une Inondation (en haut à droite de l'écran ou de la carte). Cela ouvre le formulaire.",
+                "Votre GPS détecte automatiquement votre position et l'affiche sur une carte. Faites glisser le pin pour ajuster votre position exacte.",
+                "La profondeur de l'eau est optionnelle — sélectionnez cheville/genou/taille/poitrine/impraticable si vous la connaissez. Si laissé vide, le niveau minimum est enregistré.",
+                "La description est optionnelle — si laissée vide, le système enregistre 'cette personne a besoin d'aide, vérifiez les fichiers envoyés'.",
+                "Vous DEVEZ joindre au moins un: 📷 Photo (appuyez pour utiliser la caméra), 🎤 Voix (enregistrez jusqu'à 60 secondes), ou 🎥 Vidéo.",
+                "Appuyez sur Soumettre le Rapport. Il va directement aux coordinateurs NIHSA pour vérification. Les rapports vérifiés apparaissent sur la carte.",
+            ]
+        },
+    },
+
+    "alerts": {
+        "en": {
+            "title": "Understanding Flood Alerts",
+            "steps": [
+                "🟢 NORMAL: River levels within safe range. No action needed. Stay informed via the app.",
+                "🟡 WATCH: Levels rising — prepare emergency kit, know your evacuation route, avoid riverbanks.",
+                "🟠 HIGH: Flooding expected in 12–24 hours — move valuables to high ground, prepare to evacuate.",
+                "🔴 CRITICAL/EXTREME: Evacuate NOW. Do not cross flooded roads. Call emergency services immediately.",
+                "Alerts are generated by the NFFS (LSTM deep learning model on 70 basins) and verified by NIHSA hydrologists.",
+                "Active alerts scroll as a ticker at the bottom of every screen. Tap the ticker to go to the Alerts tab for full details.",
+            ]
+        },
+        "ha": {
+            "title": "Fahimtar Faɗakarwar Ambaliya",
+            "steps": [
+                "🟢 AL'ADA: Matakan kogi suna cikin kewayon aminci. Babu aiki da ake bukata. Kasance da labari ta app.",
+                "🟡 KALLO: Matakan suna tashi — shirya kayan gaggawa, san hanyar tserewarka, guji bankunan kogi.",
+                "🟠 BABBA: Ana sa ran ambaliya cikin awanni 12-24 — ɗauki kayan daraja zuwa wurin da ya fi tsayi, shirya ƙaura.",
+                "🔴 MATSANANCI/MAI KARFI: Gudu YANZU. Kada ku ketara hanyoyin ruwa. Kira sabis na gaggawa nan da nan.",
+                "Ana samar da faɗakarwa ta hanyar NFFS (samfurin LSTM akan kwandidon 70) kuma masu ilimin ruwa na NIHSA suna tabbatar da su.",
+                "Faɗakarwa masu aiki suna gungura a ƙasan kowace allo. Taɓa tepe don zuwa tab na Faɗakarwa.",
+            ]
+        },
+        "yo": {
+            "title": "Oye Awọn Ìkìlọ̀ Iṣan-omi",
+            "steps": [
+                "🟢 DEEDE: Awọn ipele odò laarin iwọn ailewu. Ko si igbese ti o nilo. Wa alaye nipasẹ app.",
+                "🟡 WIWO: Awọn ipele n dide — mura apo pajawiri, mọ ipa ọna iṣapá, yago fun awọn bèbe odò.",
+                "🟠 GIGA: Iṣan-omi nireti ni wakati 12-24 — gbe ohun iyebiye si ilẹ giga, mura fun iṣapá.",
+                "🔴 PATAKI/AJALU: Salọ BAYI. Maṣe gbiyanju lati rekọja awọn ọna ti iṣan-omi. Pe awọn iṣẹ pajawiri lẹsẹkẹsẹ.",
+                "Awọn ìkìlọ̀ jẹ ipilẹṣẹ nipasẹ NFFS (awoṣe ẹkọ ijinlẹ LSTM lori awọn agbada 70) ati fọwọsi nipasẹ awọn onimọ-omi NIHSA.",
+                "Awọn ìkìlọ̀ ti nṣiṣẹ n yipo bi ticker ni isalẹ gbogbo iboju. Tẹ ticker lati lọ si tab Awọn Ìkìlọ̀.",
+            ]
+        },
+        "ig": {
+            "title": "Ighọta Ọkwa Mmiri Ozuzo",
+            "steps": [
+                "🟢 NKỊTỊ: Ọkwa osimiri n'ime ogo nchekwa. Ọ dịghị ihe achọrọ ime. Nọgide na-ama ozi site na ngwa.",
+                "🟡 ELE ANYA: Ọkwa na-arị elu — kwado ngwugwu ihe mberede, mara ụzọ nnarị gị, zere ụsọ osimiri.",
+                "🟠 ELU: A na-atọ anya mmiri ozuzo n'ime awa 12-24 — bugharịa ihe ndị bara uru n'elu ala, kwado ịnnarị.",
+                "🔴 SIRI IKE/IHE MBEREDE: Narịa UGBU A. Ọ dịghị ike iga n'okporo ụzọ mmiri. Kpọọ ọrụ ihe mberede ozugbo.",
+                "A na-emepụta ọkwa site na NFFS (ihe atụmatụ LSTM n'ụzọ mmiri 70) ma ndị ọkà mmụta mmiri NIHSA kwadoro ha.",
+                "Ọkwa na-arụ ọrụ na-atọgharị dị ka ticker n'ala ihuenyo ọ bụla. Kụọ ticker iji gaa tab Ọkwa.",
+            ]
+        },
+        "fr": {
+            "title": "Comprendre les Alertes d'Inondation",
+            "steps": [
+                "🟢 NORMAL: Niveaux des rivières dans la plage sûre. Aucune action nécessaire. Restez informé via l'app.",
+                "🟡 SURVEILLANCE: Niveaux en hausse — préparez votre kit d'urgence, connaissez votre itinéraire d'évacuation, évitez les rives.",
+                "🟠 ÉLEVÉ: Inondation attendue dans 12-24 heures — mettez les objets de valeur en hauteur, préparez-vous à évacuer.",
+                "🔴 CRITIQUE/EXTRÊME: Évacuez MAINTENANT. Ne traversez pas les routes inondées. Appelez les services d'urgence immédiatement.",
+                "Les alertes sont générées par le NFFS (modèle LSTM sur 70 bassins) et vérifiées par les hydrologues NIHSA.",
+                "Les alertes actives défilent en bandeau en bas de chaque écran. Appuyez sur le bandeau pour aller à l'onglet Alertes.",
+            ]
+        },
+    },
+
+    "map": {
+        "en": {
+            "title": "Using the Map",
+            "steps": [
+                "Tap 📍 to fly to your GPS location. On Android, grant Location permission in Settings → App Permissions → Location → Allow.",
+                "Use the search bar to find any community, LGA, state, or landmark. Tap a result to fly the map there.",
+                "Blue circles = NIHSA gauge stations. Green = normal, Yellow = watch, Orange = high, Red = critical. Tap for readings.",
+                "Alert markers show where NIHSA has issued warnings. Tap for the full alert message, affected LGAs, and actions.",
+                "Open 🗂️ Map Layers (top-left) to toggle: AFO 2026 flood extent, population at risk, health facilities, schools, farmland, surface water alerts, and more.",
+                "Tap 🚨 Report Flood to submit a report directly from the map — your GPS pin is pre-set.",
+            ]
+        },
+        "ha": {
+            "title": "Amfani da Taswira",
+            "steps": [
+                "Danna 📍 don tashi zuwa wurin GPS ɗinku. A kan Android, ba da izinin Wuri a cikin Saitunan → Izinin App → Wuri → Yarda.",
+                "Yi amfani da sandar bincike don nemo wata al'umma, LGA, jiha, ko wuri. Taɓa sakamakon don tashi da taswira zuwa can.",
+                "Da'irori masu launin shuɗi = tashar aunawa ta NIHSA. Kore = al'ada, Rawaya = kallo, Orange = babba, Ja = matsananci. Taɓa don karantawa.",
+                "Alamomin faɗakarwa suna nuna inda NIHSA ta ba da gargaɗi. Taɓa don cikakken sakon, LGAs da ayyukan da aka shafa.",
+                "Buɗe 🗂️ Matakan Taswira (hagu sama) don kunna: AFO 2026 fadawar ambaliya, yawan jama'a cikin haɗari, cibiyoyin lafiya, makarantu, gonaki, da ƙari.",
+                "Danna 🚨 Rahoton Ambaliya don aika rahoto kai tsaye daga taswira — pin GPS ɗinka an riga an saita.",
+            ]
+        },
+        "yo": {
+            "title": "Lilo Maapu",
+            "steps": [
+                "Tẹ 📍 lati fo si ipo GPS rẹ. Lori Android, fun igbanilaaye Ipo ni Eto → Awọn Igbanilaaye App → Ipo → Gba.",
+                "Lo ọpa wiwa lati wa agbegbe, LGA, ipinlẹ, tabi aami-ilẹ. Tẹ abajade lati fo maapu si ibẹ.",
+                "Awọn iyika buluu = awọn ibudo gauge NIHSA. Alawọ = deede, Ofeefee = wiwo, Osan = giga, Pupa = pataki. Tẹ fun awọn kika.",
+                "Awọn aami ìkìlọ̀ fihan ibiti NIHSA ti ṣe awọn ikilọ. Tẹ fun ifiranṣẹ ìkìlọ̀ kikun, awọn LGA ti o kan, ati awọn igbese.",
+                "Ṣii 🗂️ Awọn Fẹlẹfẹlẹ Maapu (osi oke) lati yipada: iye iṣan-omi AFO 2026, olugbe ninu ewu, awọn ile itọju ilera, awọn ile-iwe, ilẹ oko, ati diẹ sii.",
+                "Tẹ 🚨 Jabo Iṣan-omi lati fi ijabọ silẹ taara lati maapu — pin GPS rẹ ti wa ni titọ tẹlẹ.",
+            ]
+        },
+        "ig": {
+            "title": "Iji Maapu",
+            "steps": [
+                "Kụọ 📍 iji wụọ ọnọdụ GPS gị. N'Android, nye ikike Ọnọdụ na Nhazi → Ikike Ngwa → Ọnọdụ → Kwe.",
+                "Jiri ọwa ọchọ iji chọọ obodo, LGA, steeti, ma ọ bụ akara. Kụọ nsonaazụ iji gbaa maapu n'ọnọdụ ahụ.",
+                "Okirikiri ojii = ọdụ gauge NIHSA. Ọcha = nkịtị, Odo edo = ele anya, Ọrọ ọcha = elu, Ọbara ọbara = siri ike. Kụọ maka ọgụgụ.",
+                "Ihe nchọpụta ọkwa na-egosi ebe NIHSA nyere ọkwa. Kụọ maka ozi ọkwa zuru oke, LGAs metụtara, na omume.",
+                "Mepee 🗂️ Ọtụtụ Ihe Maapu (aka ekpe elu) iji tụgharịa: mmiri ozuzo AFO 2026, ndị mmadụ n'ihe ize ndụ, ụlọ ọgwụ, ụlọ akwụkwọ, ala ugbo, na ndị ọzọ.",
+                "Kụọ 🚨 Kọọ Mmiri Ozuzo iji zipu akụkọ ozugbo site na maapu — pin GPS gị edochibisịrị ụzọ.",
+            ]
+        },
+        "fr": {
+            "title": "Utiliser la Carte",
+            "steps": [
+                "Appuyez sur 📍 pour voler à votre position GPS. Sur Android, accordez la permission Localisation dans Paramètres → Autorisations → Localisation → Autoriser.",
+                "Utilisez la barre de recherche pour trouver une communauté, LGA, État ou repère. Appuyez sur un résultat pour faire voler la carte.",
+                "Cercles bleus = stations de jaugeage NIHSA. Vert = normal, Jaune = surveillance, Orange = élevé, Rouge = critique. Appuyez pour les lectures.",
+                "Les marqueurs d'alerte indiquent où la NIHSA a émis des avertissements. Appuyez pour le message complet, les LGA et les actions recommandées.",
+                "Ouvrez 🗂️ Couches de Carte (haut gauche) pour activer: étendue des inondations AFO 2026, population à risque, établissements de santé, écoles, terres agricoles, et plus.",
+                "Appuyez sur 🚨 Signaler pour soumettre un rapport directement depuis la carte — votre pin GPS est prédéfini.",
+            ]
+        },
+    },
+
+    "vanguard": {
+        "en": {
+            "title": "Flood Marshals Network",
+            "steps": [
+                "The Vanguard network is NIHSA's real-time coordination system — used by Flood Marshals and staff to manage flood events across Nigeria's 36 states + FCT.",
+                "38 channels: one per state, one for FCT (Abuja), and one National command channel for cross-state coordination.",
+                "Only verified Flood Marshals (Vanguard role), NIHSA Staff, government officials, and admins can post. Citizens can view all messages.",
+                "To become a Flood Marshal: register, check 'I am a Flood Marshal', and wait for NIHSA approval. Approved users can post in their state channel.",
+                "Messages sync in real-time via WebSocket. If connection drops, messages reload automatically on reconnect.",
+                "Even without signing in, you can view all messages and follow live situational updates from Flood Marshals in the field.",
+            ]
+        },
+        "ha": {
+            "title": "Hanyar Masu Kiyaye Ambaliya",
+            "steps": [
+                "Hanyar Vanguard ita ce tsarin daidaitawa na gaskiya ta NIHSA — ana amfani da ita da Masu Kiyaye Ambaliya da ma'aikata don sarrafa abubuwan ambaliya a cikin jihohi 36 na Najeriya + FCT.",
+                "Tasoshi 38: ɗaya ga kowace jiha, ɗaya don FCT (Abuja), da ɗaya Tashar Umarni ta Ƙasa don daidaita tsakanin jihohi.",
+                "Masu Kiyaye Ambaliya da aka tabbatar (Matsayin Vanguard), ma'aikatan NIHSA, da ma'aikatan gwamnati ne kawai za su iya aika. Ɗan ƙasa na iya duba duk sakonni.",
+                "Don zama Mai Kiyaye Ambaliya: yi rajista, duba 'Ni ne Mai Kiyaye Ambaliya', kuma jira amincewar NIHSA. Masu amincewa na iya aika a tashar jiharsu.",
+                "Sakonni suna aiki kai tsaye ta WebSocket. Idan haɗin yanar gizo ya faɗi, sakonni za a sake loda su kai tsaye akan sake haɗawa.",
+                "Ko ba tare da shiga ba, kuna iya duba duk sakonni da kuma bin sabuntawa ta gaskiya daga Masu Kiyaye Ambaliya a filin.",
+            ]
+        },
+        "yo": {
+            "title": "Nẹtiwọọki Awọn Oluso Iṣan-omi",
+            "steps": [
+                "Nẹtiwọọki Vanguard jẹ eto isọdọkan gidi-akoko NIHSA — Awọn Oluso Iṣan-omi ati oṣiṣẹ lo lati ṣakoso awọn iṣẹlẹ iṣan-omi kọja awọn ipinlẹ 36 Naijiria + FCT.",
+                "Ikanni 38: ọkan fun ipinlẹ kọọkan, ọkan fun FCT (Abuja), ati ọkan Ikanni Aṣẹ Orilẹ-ede fun isọdọkan agbelebu-ipinlẹ.",
+                "Awọn Oluso Iṣan-omi ti a fọwọsi (ipa Vanguard), Oṣiṣẹ NIHSA, ati awọn oṣiṣẹ ijọba nikan le firanṣẹ. Ara ilu le wo gbogbo awọn ifiranṣẹ.",
+                "Lati di Oluso Iṣan-omi: forukọsilẹ, samisi 'Emi ni Oluso Iṣan-omi', ki o si duro fun ifọwọsi NIHSA. Awọn olumulo ti a fọwọsi le firanṣẹ ninu ikanni ipinlẹ wọn.",
+                "Awọn ifiranṣẹ n ṣiṣẹpọ ni akoko gidi nipasẹ WebSocket. Ti asopọ ba ṣubu, awọn ifiranṣẹ tun load laifọwọyi lori isopọ.",
+                "Paapaa laisi wiwọle, o le wo gbogbo awọn ifiranṣẹ ati tẹle awọn imudojuiwọn ipo laaye lati Awọn Oluso ni aaye.",
+            ]
+        },
+        "ig": {
+            "title": "Netwọk Ndị Nlekota Mmiri Ozuzo",
+            "steps": [
+                "Netwọk Vanguard bụ sistemu nhazi oge-ndụ NIHSA — Ndị Nlekota Mmiri Ozuzo na ndị ọrụ na-eji ya ijikwa ihe mmiri ozuzo n'elu steeti 36 Naịjirịa + FCT.",
+                "Ọwa 38: otu maka steeti ọ bụla, otu maka FCT (Abuja), na otu Ọwa Iwu Mba maka nhazi steeti-nkwụsịtụ.",
+                "Naanị Ndị Nlekota kwadoro (ọrụ Vanguard), ndị ọrụ NIHSA, na ndị ọchịchọ gọọmentị nwere ike iziga. Ndị ọchịchọ nwere ike ilelee ozi niile.",
+                "Iji bụrụ Onye Nlekota: debanye aha, zaznachụ 'Abụ m Onye Nlekota Mmiri Ozuzo', wee chere nkwado NIHSA. Ndị nkwadoro nwere ike iziga na ọwa steeti ha.",
+                "Ozi na-emekọ ihe n'oge ndụ site na WebSocket. Ọ bụrụ na njikọ daa, ozi na-abuọ lode ozugbo mgbe atụkwara njikọ.",
+                "Ọbụlagodi na-enweghị ịbanye, ị nwere ike ilelee ozi niile ma soro mmelite ọnọdụ ndụ site na Ndị Nlekota n'ebe ọrụ.",
+            ]
+        },
+        "fr": {
+            "title": "Réseau des Gardes des Inondations",
+            "steps": [
+                "Le réseau Vanguard est le système de coordination en temps réel de la NIHSA — utilisé par les Gardes et le personnel pour gérer les événements d'inondation à travers les 36 États du Nigeria + FCT.",
+                "38 canaux: un par État, un pour le FCT (Abuja), et un canal de commandement national pour la coordination inter-États.",
+                "Seuls les Gardes vérifiés (rôle Vanguard), le personnel NIHSA et les fonctionnaires gouvernementaux peuvent poster. Les citoyens peuvent voir tous les messages.",
+                "Pour devenir Garde: inscrivez-vous, cochez 'Je suis Garde des Inondations', et attendez l'approbation NIHSA. Les utilisateurs approuvés peuvent poster dans leur canal d'État.",
+                "Les messages se synchronisent en temps réel via WebSocket. Si la connexion est perdue, les messages se rechargent automatiquement à la reconnexion.",
+                "Même sans se connecter, vous pouvez voir tous les messages et suivre les mises à jour de situation en direct des Gardes sur le terrain.",
+            ]
+        },
+    },
+
+    "dashboard": {
+        "en": {
+            "title": "Dashboard Guide",
+            "steps": [
+                "Toggle between Annual (AFO 2026) and Weekly views at the top of the Dashboard tab.",
+                "Annual view shows the full 2026 Flood Outlook — exposure data across 17 layers for all of Nigeria.",
+                "Weekly view shows the current 7-day forecast — data is uploaded by NIHSA Admin when available.",
+                "The exposure cards show totals for communities, people, health centres, schools, farmland (ha), roads (km), electricity, and markets at flood risk.",
+                "Use the state dropdown to filter data by state and see state-specific exposure figures and map links.",
+                "Tap 'Flood Animation' or 'Flood Extent Map' to open interactive NFFS model output maps for that state or nationally.",
+            ]
+        },
+        "ha": {
+            "title": "Jagoran Allon Bayanai",
+            "steps": [
+                "Canza tsakanin ra'ayi na Shekara (AFO 2026) da na Mako a sama na tab na Allon Bayanai.",
+                "Ra'ayi na Shekara yana nuna cikakken Hasashen Ambaliya 2026 — bayanan fallasa a cikin yadudduka 17 ga dukkan Najeriya.",
+                "Ra'ayi na Mako yana nuna hasashen kwanaki 7 na yanzu — ana loda bayanan ta masu kulawa na NIHSA idan ana da su.",
+                "Katunan fallasa suna nuna jimlar al'umma, mutane, cibiyoyin lafiya, makarantu, gonaki (ha), hanyoyi (km), wutar lantarki, da kasuwanni cikin haɗarin ambaliya.",
+                "Yi amfani da zaɓi na jiha don tace bayanan ta jiha da ganin adadin fallasa na jiha da haɗin taswira.",
+                "Danna 'Motsin Ambaliya' ko 'Taswira ta Fadawar Ambaliya' don buɗe taswira mai aiki na fitarwar samfurin NFFS.",
+            ]
+        },
+        "yo": {
+            "title": "Itọsọna Paali Alaye",
+            "steps": [
+                "Yipada laarin awọn iwoye Lọdọọdún (AFO 2026) ati Ọsẹ ni oke tab Paali Alaye.",
+                "Iwoye Lọdọọdún fihan Asọtẹlẹ Iṣan-omi 2026 ni kikun — data ifihan kọja awọn fẹlẹfẹlẹ 17 fun Naijiria gbogbo.",
+                "Iwoye Ọsẹ fihan asọtẹlẹ ọjọ 7 lọwọlọwọ — data gbesoke nipasẹ NIHSA Admin nigba ti o wa.",
+                "Awọn kaadi ifihan fihan awọn apapọ fun awọn agbegbe, eniyan, awọn ile itọju ilera, awọn ile-iwe, ilẹ oko (ha), awọn ọna (km), ina mọnamọna, ati awọn ọja ninu ewu iṣan-omi.",
+                "Lo akojọ silẹ ipinlẹ lati ṣàlẹmọ data nipasẹ ipinlẹ ki o wo awọn nọmba ifihan ipinlẹ kan pato ati awọn ọna asopọ maapu.",
+                "Tẹ 'Agbeka Iṣan-omi' tabi 'Maapu Iye Iṣan-omi' lati ṣii awọn maapu iṣẹ-awoṣe NFFS fun ipinlẹ yẹn tabi ti orilẹ-ede.",
+            ]
+        },
+        "ig": {
+            "title": "Nduzi Penu Ozi",
+            "steps": [
+                "Gbanwee n'etiti ọhụụ Ọdụn (AFO 2026) na Izu n'elu tab Penu Ozi.",
+                "Ọhụụ Ọdụn na-egosi Atụmatụ Mmiri Ozuzo 2026 zuru oke — data mficha n'elu ọkwa 17 maka Naịjirịa niile.",
+                "Ọhụụ Izu na-egosi atụmatụ ụbọchị 7 ugbu a — a na-ebutere data site na Admin NIHSA mgbe ọ dị.",
+                "Kaadị mficha na-egosi ngụkọ maka obodo, ndị mmadụ, ụlọ ọgwụ, ụlọ akwụkwọ, ala ugbo (ha), okporo ụzọ (km), ọkụ eletrik, na ahia n'ihe ize ndụ mmiri ozuzo.",
+                "Jiri dropụdaụn steeti iji lelee data site n'steeti hụ ọnụọgụ mficha steeti ya na njikọ maapu.",
+                "Kụọ 'Ngagharị Mmiri Ozuzo' ma ọ bụ 'Maapu Ọdịdị Mmiri Ozuzo' iji mepee maapu mmepụta ihe atụmatụ NFFS.",
+            ]
+        },
+        "fr": {
+            "title": "Guide du Tableau de Bord",
+            "steps": [
+                "Basculez entre les vues Annuelle (AFO 2026) et Hebdomadaire en haut de l'onglet Tableau de Bord.",
+                "La vue Annuelle montre les Perspectives d'Inondation 2026 complètes — données d'exposition sur 17 couches pour tout le Nigeria.",
+                "La vue Hebdomadaire montre les prévisions des 7 prochains jours — données mises à jour par l'Admin NIHSA lorsque disponibles.",
+                "Les cartes d'exposition montrent les totaux pour les communautés, personnes, centres de santé, écoles, terres agricoles (ha), routes (km), électricité et marchés à risque.",
+                "Utilisez la liste déroulante d'État pour filtrer par État et voir les chiffres d'exposition spécifiques et les liens de carte.",
+                "Appuyez sur 'Animation d'Inondation' ou 'Carte d'Étendue' pour ouvrir les cartes de sortie du modèle NFFS interactives.",
+            ]
+        },
+    },
+
+    "assistant": {
+        "en": {
+            "title": "Using the AI Assistant",
+            "steps": [
+                "NIHSA FloodAI is trained specifically for Nigerian flood safety and hydrology. Do NOT ask it general questions — use it only for flood, water, and emergency topics.",
+                "Type your question in the chat box and tap Ask, or tap 🎤 to speak — your voice is transcribed by Whisper AI and sent automatically.",
+                "The AI detects your language automatically and responds in Hausa, Yoruba, Igbo, French, or English.",
+                "You can ask about: flood risk for your area, what a gauge reading means, evacuation procedures, flood safety tips, NFFS model data, river levels, AFO 2026 forecast.",
+                "Daily limits: Citizens = 5 prompts/day, Vanguard = 10, Researchers/Government = 20, NIHSA Staff = 50. Sign in to use prompts.",
+                "The AI can trigger actions: open the flood report form, navigate to a tab, or show a tutorial — just ask naturally.",
+            ]
+        },
+        "ha": {
+            "title": "Amfani da Mataimaki na AI",
+            "steps": [
+                "NIHSA FloodAI an horar da shi musamman don amincin ambaliya da ilimin ruwa na Najeriya. KADA ka yi tambayoyin gaba ɗaya — yi amfani da shi kawai don batu na ambaliya, ruwa, da gaggawa.",
+                "Rubuta tambayarka a cikin akwatin tattaunawa kuma danna Tambayi, ko danna 🎤 don magana — ana fassara muryarku ta Whisper AI kuma ana aika kai tsaye.",
+                "AI yana gano harsheka kai tsaye kuma yana amsa da Hausa, Yoruba, Igbo, Faransanci, ko Turanci.",
+                "Kuna iya tambaya game da: haɗarin ambaliya a yankinku, abin da karantawar aunawa ke nufi, hanyoyin kwasawa, shawarwarin amincin ambaliya, bayanai na samfurin NFFS, matakan kogi, hasashe na AFO 2026.",
+                "Iyakar yau da kullun: Ɗan ƙasa = tambayoyi 5/rana, Vanguard = 10, Masu bincike/Gwamnati = 20, Ma'aikatan NIHSA = 50. Shiga don amfani da tambayoyi.",
+                "AI na iya kunna ayyuka: buɗe fom na rahoton ambaliya, tafiya zuwa tab, ko nuna tutorial — kawai tambayi da dabi'a.",
+            ]
+        },
+        "yo": {
+            "title": "Lilo Oluranlowo AI",
+            "steps": [
+                "NIHSA FloodAI jẹ ikẹkọ ni pataki fun aabo iṣan-omi ati imọ-omi Naijiria. MAṢE beere awọn ibeere gbogbogbo — lo nikan fun awọn koko iṣan-omi, omi, ati pajawiri.",
+                "Tẹ ibeere rẹ sinu apoti ibaraẹnisọrọ ki o tẹ Beere, tabi tẹ 🎤 lati sọrọ — ohun rẹ jẹ tumọ nipasẹ Whisper AI ti a si firanṣẹ laifọwọyi.",
+                "AI ṣawari ede rẹ laifọwọyi ati dahun ni Hausa, Yoruba, Igbo, Faranse, tabi Gẹẹsi.",
+                "O le beere nipa: eewu iṣan-omi fun agbegbe rẹ, ohun ti kika gauge tumọ si, awọn ilana iṣapá, awọn imọran aabo iṣan-omi, data awoṣe NFFS, awọn ipele odò, asọtẹlẹ AFO 2026.",
+                "Awọn opin ojoojumọ: Ara ilu = awọn ibeere 5/ọjọ, Vanguard = 10, Awọn oniwadi/Ijọba = 20, Oṣiṣẹ NIHSA = 50. Wọle lati lo awọn ibeere.",
+                "AI le mu awọn iṣe ṣẹ: ṣii fọọmu ijabọ iṣan-omi, lọ si tab, tabi fihan itọnisọna — beere nipa ti ara.",
+            ]
+        },
+        "ig": {
+            "title": "Iji Onye Enyemaka AI",
+            "steps": [
+                "E zigara NIHSA FloodAI ọzụzụ kpọmkwem maka nchekwa mmiri ozuzo na mmụta mmiri Naịjirịa. ACHỌGHỊ ịjụ ajụjụ izugbe — jiri ya naanị maka ihe mmiri ozuzo, mmiri, na ihe mberede.",
+                "Dee ajụjụ gị n'ime igbe mkparịta ụka wee kụọ Jụọ, ma ọ bụ kụọ 🎤 iji kwuo — a na-atụgharịa olu gị site na Whisper AI ma zigaa ozugbo.",
+                "AI na-achọpụta asụsụ gị ozugbo ma zaghachi n'Hausa, Yoruba, Igbo, Faransị, ma ọ bụ Bekee.",
+                "Ị nwere ike ịjụ maka: ihe ize ndụ mmiri ozuzo maka mpaghara gị, ihe ọgụgụ gauge pụtara, usoro nnarị, ndụmọdụ nchekwa mmiri ozuzo, data ihe atụmatụ NFFS, ọkwa osimiri, atụmatụ AFO 2026.",
+                "Oke ụbọchị: Ndị ọchịchọ = ajụjụ 5/ụbọchị, Vanguard = 10, Ndị nyocha/Gọọmentị = 20, Ndị ọrụ NIHSA = 50. Banye iji jiri ajụjụ.",
+                "AI nwere ike ibute omume: mepee ụdị akụkọ mmiri ozuzo, gaa tab, ma ọ bụ gosipụta nkuzi — jụọ n'ụzọ dị mfe.",
+            ]
+        },
+        "fr": {
+            "title": "Utiliser l'Assistant IA",
+            "steps": [
+                "NIHSA FloodAI est formé spécifiquement pour la sécurité des inondations et l'hydrologie nigériane. Ne posez PAS de questions générales — utilisez-le uniquement pour les sujets d'inondation, d'eau et d'urgence.",
+                "Tapez votre question dans la boîte de chat et appuyez sur Demander, ou appuyez sur 🎤 pour parler — votre voix est transcrite par Whisper AI et envoyée automatiquement.",
+                "L'IA détecte votre langue automatiquement et répond en Haoussa, Yoruba, Igbo, Français ou Anglais.",
+                "Vous pouvez demander: le risque d'inondation pour votre zone, ce que signifie une lecture de jauge, les procédures d'évacuation, les conseils de sécurité, les données NFFS, les niveaux des rivières, les prévisions AFO 2026.",
+                "Limites quotidiennes: Citoyens = 5 requêtes/jour, Vanguard = 10, Chercheurs/Gouvernement = 20, Personnel NIHSA = 50. Connectez-vous pour utiliser les requêtes.",
+                "L'IA peut déclencher des actions: ouvrir le formulaire de rapport, naviguer vers un onglet, ou afficher un tutoriel — demandez naturellement.",
+            ]
+        },
+    },
+}
+
+# ============================================================================
+# FUNCTION CALLING TOOLS
 # ============================================================================
 
 TOOLS = [
@@ -107,14 +940,8 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "prefill_location": {
-                        "type": "string",
-                        "description": "Optional location to pre-fill in the report form"
-                    },
-                    "prefill_description": {
-                        "type": "string",
-                        "description": "Optional description to pre-fill"
-                    }
+                    "prefill_location": {"type": "string", "description": "Location to pre-fill"},
+                    "prefill_description": {"type": "string", "description": "Description to pre-fill"}
                 },
                 "required": []
             }
@@ -124,7 +951,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "navigate_to_tab",
-            "description": "User wants to switch to a different tab in the app.",
+            "description": "User wants to navigate to a different tab in the app.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -148,7 +975,7 @@ TOOLS = [
                 "properties": {
                     "topic": {
                         "type": "string",
-                        "enum": ["reporting", "alerts", "map", "vanguard", "dashboard", "general"],
+                        "enum": ["reporting", "alerts", "map", "vanguard", "dashboard", "general", "assistant"],
                         "description": "The tutorial topic"
                     }
                 },
@@ -164,10 +991,7 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Location search query (e.g., city, state, landmark)"
-                    }
+                    "query": {"type": "string", "description": "Location search query"}
                 },
                 "required": ["query"]
             }
@@ -181,10 +1005,7 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "location": {
-                        "type": "string",
-                        "description": "Location to check flood status for"
-                    }
+                    "location": {"type": "string", "description": "Location to check"}
                 },
                 "required": ["location"]
             }
@@ -198,10 +1019,7 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "reason": {
-                        "type": "string",
-                        "description": "Optional reason for escalation"
-                    }
+                    "reason": {"type": "string"}
                 },
                 "required": []
             }
@@ -210,703 +1028,34 @@ TOOLS = [
 ]
 
 # ============================================================================
-# TUTORIAL CONTENT (Multi-language) - COMPLETE, UNCHANGED
+# ROLE LABELS
 # ============================================================================
 
-TUTORIALS = {
-    "general": {
-        "en": {
-            "title": "Welcome to NIHSA Flood Intelligence",
-            "steps": [
-                "Map tab: View live flood conditions, river gauges, and alerts on the interactive map",
-                "Dashboard tab: See flood statistics and outlook summaries",
-                "Vanguard tab: Join the Flood Marshals coordination network",
-                "Assistant tab: Ask me questions about flood safety and get help",
-                "Alerts tab: Browse all active flood warnings and alerts",
-                "Tap the 🚨 button to report flooding in your area"
-            ]
-        },
-        "ha": {
-            "title": "Barka da zuwa NIHSA Flood Intelligence",
-            "steps": [
-                "Taswirar Map: Duba yanayin ambaliya kai tsaye, ma'aunin kogi, da fadakarwa akan taswira",
-                "Allon Dashboard: Duba kididdigar ambaliya da takaitaccen hasashe",
-                "Tashar Vanguard: Shiga cibiyar sadarwar Masu Kiyaye Ambaliya",
-                "Taimakon Assistant: Yi mani tambayoyi game da amincin ambaliya",
-                "Shafin Alerts: Bincika duk fadakarwa da gargadin ambaliya",
-                "Danna maɓallin 🚨 don bayar da rahoton ambaliya a yankinku"
-            ]
-        },
-        "yo": {
-            "title": "Kaabọ si NIHSA Flood Intelligence",
-            "steps": [
-                "Maapu: Wo ipo iṣan-omi laaye, awon gauji odo, ati awon ifokanbalẹ lori maapu",
-                "Paali Alaye: Wo awon iṣiro iṣan-omi ati akojọpọ asotele",
-                "Ikanni Vanguard: Dara pọ mọ nẹtiwọki awon Oluso Iṣan-omi",
-                "Oluranlọwọ Assistant: Beere awon ibeere nipa aabo iṣan-omi",
-                "Taabu Alerts: Ṣawari gbogbo awon ikilo ati ifokanbalẹ iṣan-omi ti n ṣiṣẹ",
-                "Tẹ bọtini 🚨 lati jabo iṣan-omi ni agbegbe rẹ"
-            ]
-        },
-        "ig": {
-            "title": "Nnọọ na NIHSA Flood Intelligence",
-            "steps": [
-                "Maapu: Lelee ọnọdụ mmiri ozuzo, ihe nzụta osimiri, na ọkwa na maapụ ahụ",
-                "Dashboard: Hụ ọnụ ọgụgụ mmiri ozuzo na nchịkọta amụma",
-                "Vanguard: Soro na netwọk nke ndị Nlekota Mmiri Ozuzo",
-                "Onye Enyemaka: Jụọ m ajụjụ gbasara nchekwa mmiri ozuzo",
-                "Alerts: Chọgharịa ọkwa mmiri ozuzo na ịdọ aka ná ntị niile",
-                "Pịa bọtịnụ 🚨 iji kọọ mmiri ozuzo n'ógbè gị"
-            ]
-        },
-        "fr": {
-            "title": "Bienvenue sur NIHSA Flood Intelligence",
-            "steps": [
-                "Carte: Voir les conditions d'inondation en direct et les alertes sur la carte",
-                "Tableau de bord: Voir les statistiques et les prévisions",
-                "Vanguard: Rejoignez le réseau des Maréchaux des Crues",
-                "Assistant: Posez-moi des questions sur la sécurité des inondations",
-                "Alertes: Parcourir tous les avertissements actifs",
-                "Appuyez sur 🚨 pour signaler une inondation dans votre région"
-            ]
-        }
-    },
-    "reporting": {
-        "en": {
-            "title": "How to Report a Flood",
-            "steps": [
-                "Tap the red 'Report Flood' button (🚨) on the map screen",
-                "Your GPS location will be automatically detected",
-                "Drag the pin on the map to adjust the exact location if needed",
-                "Select the water depth from the dropdown (ankle to impassable)",
-                "Describe what you see - roads blocked, homes affected, people stranded",
-                "Optionally add a photo, voice note, or short video",
-                "Tap 'Submit Flood Report' to send to NIHSA coordinators",
-                "Your report will be verified and may appear on the public map"
-            ]
-        },
-        "ha": {
-            "title": "Yadda Ake Bayar da Rahoton Ambaliya",
-            "steps": [
-                "Danna jan maɓallin 'Rahoton Ambaliya' (🚨) akan allon taswira",
-                "Za a gano wurin GPS ɗinka kai tsaye",
-                "Ja fil ɗin akan taswira don daidaita ainihin wurin idan ana buƙata",
-                "Zaɓi zurfin ruwa daga jerin (daga idon sawu zuwa wanda ba za a iya wucewa ba)",
-                "Bayyana abin da kake gani - hanyoyi da aka toshe, gidajen da abin ya shafa",
-                "Zabi ƙara hoto, saƙon murya, ko gajeren bidiyo",
-                "Danna 'Aika Rahoto' don aikawa ga masu gudanarwa na NIHSA",
-                "Za a tabbatar da rahotonka kuma yana iya bayyana akan taswirar jama'a"
-            ]
-        },
-        "yo": {
-            "title": "Bi O Ṣe Le Jabo Iṣan-omi",
-            "steps": [
-                "Tẹ bọtini pupa 'Jabo Iṣan-omi' (🚨) lori oju-iwe maapu",
-                "Ipo GPS rẹ yoo jẹ wiwa laifọwọyi",
-                "Fa pinni lori maapu lati ṣatunṣe ipo gangan ti o ba nilo",
-                "Yan ijinle omi lati inu akojọ (lati kokosẹ si eyiti a ko le kọja)",
-                "Ṣapejuwe ohun ti o ri - awọn ọna ti a ti di, awọn ile ti o kan",
-                "Yan lati fi fọto, ifiranṣẹ ohun, tabi fidio kukuru kun",
-                "Tẹ 'Fi Ijabo Ranṣẹ' lati fi ranṣẹ si awọn alabojuto NIHSA",
-                "Ao jẹrisi ijabo rẹ ati pe o le han lori maapu gbogbo eniyan"
-            ]
-        },
-        "ig": {
-            "title": "Otu Esi Akọọ Mmiri Ozuzo",
-            "steps": [
-                "Pịa bọtịnụ uhie 'Kọọ Mmiri Ozuzo' (🚨) na ihuenyo maapụ",
-                "A ga-achọpụta ebe GPS gị na-akpaghị aka",
-                "Dọrọ ntụtụ ahụ na maapụ ahụ iji dozie ebe ahụ kpọmkwem ma ọ dị mkpa",
-                "Họrọ omimi mmiri site na ndepụta (site na nkwonkwo ụkwụ ruo nke a na-agaghị agafe)",
-                "Kọwaa ihe ị hụrụ - okporo ụzọ egbochiri, ụlọ ndị emetụtara",
-                "Họrọ itinye foto, ozi olu, ma ọ bụ vidiyo dị mkpirikpi",
-                "Pịa 'Nyefee Akụkọ' iji ziga ndị nhazi NIHSA",
-                "A ga-enyocha akụkọ gị ma ọ nwere ike ịpụta na maapụ ọha"
-            ]
-        },
-        "fr": {
-            "title": "Comment Signaler une Inondation",
-            "steps": [
-                "Appuyez sur le bouton rouge 'Signaler une Inondation' (🚨) sur la carte",
-                "Votre position GPS sera détectée automatiquement",
-                "Faites glisser l'épingle sur la carte pour ajuster l'emplacement exact",
-                "Sélectionnez la profondeur de l'eau dans la liste (de la cheville à infranchissable)",
-                "Décrivez ce que vous voyez - routes bloquées, maisons touchées",
-                "Ajoutez éventuellement une photo, une note vocale ou une courte vidéo",
-                "Appuyez sur 'Soumettre' pour envoyer aux coordinateurs NIHSA",
-                "Votre rapport sera vérifié et pourra apparaître sur la carte publique"
-            ]
-        }
-    },
-    "alerts": {
-        "en": {
-            "title": "Understanding Flood Alerts",
-            "steps": [
-                "Alerts are color-coded by severity: Normal (green), Watch (yellow), Warning (orange), Severe (red), Extreme (dark red)",
-                "The Alerts tab shows all active warnings with details",
-                "On the map, alert icons show affected areas",
-                "Tap any alert to see full details and recommended actions",
-                "The ticker at the bottom scrolls through all active alerts",
-                "Critical alerts will trigger push notifications on your device"
-            ]
-        },
-        "ha": {
-            "title": "Fahimtar Fadakarwar Ambaliya",
-            "steps": [
-                "Fadakarwa ana nuna su da launuka gwargwadon tsanani: Al'ada (kore), Kallo (rawaya), Gargadi (orange), Mai tsanani (ja), Mai karfi (ja mai duhu)",
-                "Shafin Fadakarwa yana nuna duk gargadin da ke aiki tare da cikakkun bayanai",
-                "A kan taswira, alamun fadakarwa suna nuna wuraren da abin ya shafa",
-                "Danna kowace fadakarwa don ganin cikakkun bayanai da ayyukan da aka ba da shawara",
-                "Tikiti a ƙasa yana zagaya cikin duk fadakarwar da ke aiki"
-            ]
-        },
-        "yo": {
-            "title": "Loye Awọn Ifokanbalẹ Iṣan-omi",
-            "steps": [
-                "Awọn ifokanbalẹ jẹ ami awọ nipasẹ bi o ṣe le: Deede (alawọ ewe), Ṣọ (ofeefee), Ikilo (osun), Lile (pupa), Uje nla (pupa dudu)",
-                "Taabu Alerts fihan gbogbo awọn ikilo ti n ṣiṣẹ pẹlu awọn alaye",
-                "Lori maapu, awọn aami ifokanbalẹ fihan awọn agbegbe ti o kan",
-                "Tẹ ifokanbalẹ eyikeyi lati wo awọn alaye kikun ati awọn igbese ti a gbaniyanju",
-                "Tika ni isalẹ n yi awọn ifokanbalẹ ti n ṣiṣẹ lọ"
-            ]
-        },
-        "ig": {
-            "title": "Ịghọta Ọkwa Mmiri Ozuzo",
-            "steps": [
-                "A na-eji agba egosi ọkwa site n'ịdị njọ: Nkịtị (akwụkwọ ndụ), Lelee anya (odo), Ịdọ aka ná ntị (oroma), Siri ike (ọbara ọbara), Dị oke njọ (ọbara ọbara gbara ọchịchịrị)",
-                "Taabụ Alerts na-egosi ịdọ aka ná ntị niile na-arụ ọrụ yana nkọwa zuru ezu",
-                "Na maapụ, akara ọkwa na-egosi ebe ndị emetụtara",
-                "Pịa ọkwa ọ bụla iji hụ nkọwa zuru ezu na omume ndị a tụrụ aro"
-            ]
-        },
-        "fr": {
-            "title": "Comprendre les Alertes d'Inondation",
-            "steps": [
-                "Les alertes sont codées par couleur : Normal (vert), Surveillance (jaune), Avertissement (orange), Grave (rouge), Extrême (rouge foncé)",
-                "L'onglet Alertes affiche tous les avertissements actifs avec détails",
-                "Sur la carte, les icônes d'alerte montrent les zones touchées",
-                "Appuyez sur une alerte pour voir les détails et les actions recommandées",
-                "Le téléscripteur en bas défile toutes les alertes actives"
-            ]
-        }
-    },
-    "map": {
-        "en": {
-            "title": "Using the Flood Map",
-            "steps": [
-                "The map shows river gauge stations (colored dots) and active alerts",
-                "Use the search bar to find any location in Nigeria",
-                "Tap the 📍 button to center on your current GPS location",
-                "Layer panel (top left) lets you toggle different data overlays",
-                "Legend (bottom right) explains the color codes",
-                "Drag the map to explore, pinch to zoom in/out"
-            ]
-        },
-        "ha": {
-            "title": "Amfani da Taswirar Ambaliya",
-            "steps": [
-                "Taswirar tana nuna tashoshin ma'aunin kogi (ɗigo masu launi) da fadakarwa masu aiki",
-                "Yi amfani da mashigin bincike don nemo kowane wuri a Najeriya",
-                "Danna maɓallin 📍 don sanya taswirar a kan wurin GPS ɗinka",
-                "Panel ɗin Layer (saman hagu) yana ba ka damar kunna/kashe bayanai daban-daban",
-                "Legend (kasan dama) yana bayyana ma'anar launuka",
-                "Ja taswirar don bincika, tattara yatsu don zuƙowa ciki/waje"
-            ]
-        },
-        "yo": {
-            "title": "Lilo Maapu Iṣan-omi",
-            "steps": [
-                "Maapu na fihan awọn ibudo gauji odo (awọn aami awọ) ati awọn ifokanbalẹ ti n ṣiṣẹ",
-                "Lo ọpa wiwa lati wa eyikeyi ipo ni Nigeria",
-                "Tẹ bọtini 📍 lati fi maapu si ipo GPS rẹ lọwọlọwọ",
-                "Nronu Layer (oke apa osi) jẹ ki o yipada laarin awọn akojọpọ data oriṣiriṣi",
-                "Legend (isalẹ ọtun) ṣe alaye awọn koodu awọ",
-                "Fa maapu lati ṣawari, pọ awọn ika lati sun-un/un-un jade"
-            ]
-        },
-        "ig": {
-            "title": "Iji Maapụ Mmiri Ozuzo",
-            "steps": [
-                "Maapụ ahụ na-egosi ọdụ ihe nzụta osimiri (ntụpọ agba) na ọkwa na-arụ ọrụ",
-                "Jiri ogwe ọchụchọ chọta ebe ọ bụla na Nigeria",
-                "Pịa bọtịnụ 📍 iji tinye maapụ ahụ n'ebe GPS gị dị ugbu a",
-                "Ogwe Layer (n'elu aka ekpe) na-enye gị ohere ịgbanwe n'etiti data dị iche iche",
-                "Akụkọ nkọwa (n'ala aka nri) na-akọwa koodu agba",
-                "Dọrọ maapụ ahụ iji nyochaa, tụkọta mkpịsị aka iji bubata/bupụ"
-            ]
-        },
-        "fr": {
-            "title": "Utiliser la Carte des Inondations",
-            "steps": [
-                "La carte montre les stations de jaugeage (points colorés) et les alertes actives",
-                "Utilisez la barre de recherche pour trouver n'importe quel endroit au Nigeria",
-                "Appuyez sur 📍 pour centrer sur votre position GPS actuelle",
-                "Le panneau des couches (en haut à gauche) permet d'activer/désactiver les superpositions",
-                "La légende (en bas à droite) explique les codes couleur",
-                "Faites glisser la carte pour explorer, pincez pour zoomer"
-            ]
-        }
-    },
-    "vanguard": {
-        "en": {
-            "title": "Flood Marshals Network (Vanguard)",
-            "steps": [
-                "The Vanguard tab is a secure chat network for verified Flood Marshals",
-                "Choose from National or State-specific channels",
-                "You can read messages without signing in",
-                "To participate, sign in and request Flood Marshal verification",
-                "Share real-time observations and coordinate response efforts",
-                "NIHSA staff and coordinators monitor all channels"
-            ]
-        },
-        "ha": {
-            "title": "Cibiyar Sadarwar Masu Kiyaye Ambaliya (Vanguard)",
-            "steps": [
-                "Shafin Vanguard cibiyar tattaunawa ce mai tsaro ga Masu Kiyaye Ambaliya da aka tabbatar",
-                "Zaɓi daga tashoshin Ƙasa ko na Jiha",
-                "Kuna iya karanta saƙonni ba tare da shiga ba",
-                "Don shiga, shiga kuma nemi tabbatarwa a matsayin Mai Kiyaye Ambaliya",
-                "Raba abubuwan lura na ainihin lokaci da daidaita ƙoƙarin amsawa"
-            ]
-        },
-        "yo": {
-            "title": "Nẹtiwọki Awọn Oluso Iṣan-omi (Vanguard)",
-            "steps": [
-                "Taabu Vanguard jẹ nẹtiwọki iwiregbe ailewu fun awọn Oluso Iṣan-omi ti a fọwọsi",
-                "Yan lati awọn ikanni ti Orilẹ-ede tabi ti Ipinle",
-                "O le ka awọn ifiranṣẹ laisi wíwọle",
-                "Lati kopa, wọle ki o beere ijẹrisi Oluso Iṣan-omi",
-                "Pin awọn akiyesi akoko gidi ati ipoidojuko awọn igbiyanju idahun"
-            ]
-        },
-        "ig": {
-            "title": "Netwọk Ndị Nlekota Mmiri Ozuzo (Vanguard)",
-            "steps": [
-                "Taabụ Vanguard bụ netwọk nkata echedoro maka ndị Nlekota Mmiri Ozuzo enyochara",
-                "Họrọ site na ọwa Mba ma ọ bụ nke Steeti",
-                "Ị nwere ike ịgụ ozi n'ebanyeghị",
-                "Iji sonye, banye ma rịọ nkwenye Nlekota Mmiri Ozuzo",
-                "Kesaa ihe ndị a hụrụ n'oge na ịhazi mbọ nzaghachi"
-            ]
-        },
-        "fr": {
-            "title": "Réseau des Maréchaux des Crues (Vanguard)",
-            "steps": [
-                "L'onglet Vanguard est un réseau de chat sécurisé pour les Maréchaux des Crues vérifiés",
-                "Choisissez parmi les canaux Nationaux ou spécifiques à l'État",
-                "Vous pouvez lire les messages sans vous connecter",
-                "Pour participer, connectez-vous et demandez la vérification de Maréchal des Crues",
-                "Partagez des observations en temps réel et coordonnez les efforts"
-            ]
-        }
-    },
-    "dashboard": {
-        "en": {
-            "title": "Understanding the Dashboard",
-            "steps": [
-                "The Dashboard shows flood statistics and exposure summaries",
-                "Toggle between Annual (AFO 2026) and Weekly forecasts",
-                "See estimated impact: population at risk, schools, health facilities",
-                "Use the state filter to view data for specific states",
-                "Click any stat card to open detailed maps from the NFFS Atlas",
-                "Data is updated daily from NIHSA's flood models"
-            ]
-        },
-        "ha": {
-            "title": "Fahimtar Dashboard",
-            "steps": [
-                "Dashboard yana nuna kididdigar ambaliya da taƙaitaccen fallasa",
-                "Sauya tsakanin Hasashen Shekara (AFO 2026) da na Mako-mako",
-                "Duba kiyasin tasiri: yawan mutanen da ke cikin haɗari, makarantu, cibiyoyin lafiya",
-                "Yi amfani da tacewar jiha don duba bayanan takamaiman jihohi",
-                "Danna kowane katin ƙididdiga don buɗe taswirori daga NFFS Atlas"
-            ]
-        },
-        "yo": {
-            "title": "Loye Dashboard",
-            "steps": [
-                "Dashboard fihan awọn iṣiro iṣan-omi ati awọn akojọpọ ifihan",
-                "Yipada laarin Ọdọọdun (AFO 2026) ati awọn asọtẹlẹ Ọsẹ",
-                "Wo ipa ifoju: olugbe ti o wa ninu ewu, awọn ile-iwe, awọn ohun elo ilera",
-                "Lo àlẹmọ ipinlẹ lati wo data fun awọn ipinlẹ kan pato",
-                "Tẹ kaadi iṣiro eyikeyi lati ṣii awọn maapu alaye lati NFFS Atlas"
-            ]
-        },
-        "ig": {
-            "title": "Ịghọta Dashboard",
-            "steps": [
-                "Dashboard na-egosi ọnụ ọgụgụ mmiri ozuzo na nchịkọta mkpughe",
-                "Gbanwee n'etiti Amụma Afọ (AFO 2026) na nke Izu",
-                "Hụ mmetụta e mere atụmatụ: ọnụ ọgụgụ ndị nọ n'ihe ize ndụ, ụlọ akwụkwọ, ụlọ ọrụ ahụike",
-                "Jiri nzacha steeti lee data maka steeti ụfọdụ",
-                "Pịa kaadi ọnụ ọgụgụ ọ bụla iji mepee maapụ zuru ezu site na NFFS Atlas"
-            ]
-        },
-        "fr": {
-            "title": "Comprendre le Tableau de Bord",
-            "steps": [
-                "Le tableau de bord affiche les statistiques et résumés d'exposition",
-                "Basculez entre les prévisions Annuelles (AFO 2026) et Hebdomadaires",
-                "Voir l'impact estimé : population à risque, écoles, établissements de santé",
-                "Utilisez le filtre par État pour voir les données d'États spécifiques",
-                "Cliquez sur une carte pour ouvrir des cartes détaillées de l'Atlas NFFS"
-            ]
-        }
-    }
+ROLE_LABELS = {
+    "citizen":     "Citizen (5 prompts/day)",
+    "vanguard":    "Flood Marshal — Vanguard (10 prompts/day)",
+    "researcher":  "Researcher (20 prompts/day)",
+    "government":  "Government Official (20 prompts/day)",
+    "nihsa_staff": "NIHSA Staff (50 prompts/day)",
+    "sub_admin":   "NIHSA Sub-Admin (50 prompts/day)",
+    "admin":       "NIHSA Administrator (unlimited)",
 }
-
-# ============================================================================
-# GLOBAL STATE & CACHES
-# ============================================================================
-
-# DeepSeek client
-deepseek_client = AsyncOpenAI(
-    api_key=DEEPSEEK_API_KEY,
-    base_url="https://api.deepseek.com/v1"
-)
-
-# Google TTS client (lazy)
-_tts_client = None
-
-# HTTP client for NIHSA backend and Cloudflare
-http_client = httpx.AsyncClient(timeout=60.0)
-
-# Session storage (TTL cache: max 1000 items, 1 hour expiry)
-session_cache = TTLCache(maxsize=1000, ttl=3600)
-
-# Flood context cache (30 seconds)
-flood_context_cache = {"data": None, "timestamp": datetime.min}
-
-# Rate limiting: session_id -> list of timestamps
-rate_limit_store: Dict[str, List[datetime]] = defaultdict(list)
-
-
-# ============================================================================
-# HELPER FUNCTIONS
-# ============================================================================
-
-def check_rate_limit(session_id: str, limit: int = 20, window: int = 60) -> bool:
-    """Check if session has exceeded rate limit."""
-    now = datetime.now()
-    cutoff = now - timedelta(seconds=window)
-
-    # Clean old timestamps
-    rate_limit_store[session_id] = [
-        ts for ts in rate_limit_store[session_id] if ts > cutoff
-    ]
-
-    if len(rate_limit_store[session_id]) >= limit:
-        return False
-
-    rate_limit_store[session_id].append(now)
-    return True
-
-
-async def fetch_flood_context() -> str:
-    """Fetch current flood alerts from NIHSA backend, cached for 30 seconds."""
-    global flood_context_cache
-
-    now = datetime.now()
-    if flood_context_cache["data"] and (now - flood_context_cache["timestamp"]).seconds < 30:
-        return flood_context_cache["data"]
-
-    try:
-        response = await http_client.get(f"{NIHSA_API_URL}/forecast/ml/alerts")
-        if response.status_code == 200:
-            data = response.json()
-            alerts = data.get("alerts", [])
-            data_source = data.get("data_source", "simulation")
-
-            active = [a for a in alerts if a.get("nffs_level", "NONE") != "NONE"]
-            severe = [a for a in active if a.get("nffs_level") in ["SEVERE", "EXTREME"]]
-            lagdo = any(a.get("lagdo_cascade") for a in alerts)
-
-            context = f"""=== CURRENT FLOOD STATUS (Source: {data_source}) ===
-Date: {now.strftime('%A, %B %d, %Y')}
-Active Alerts: {len(active)} stations with elevated risk
-Severe/Extreme: {len(severe)} stations at critical levels
-Lagdo Dam Cascade: {'ACTIVE' if lagdo else 'Not active'}
-
-Station Details:
-"""
-            for a in active[:10]:  # Limit to top 10 for context size
-                context += f"- {a.get('station_name')} ({a.get('river')}, {a.get('state')}): {a.get('nffs_level')} - {a.get('headline', '')}\n"
-
-            flood_context_cache = {"data": context, "timestamp": now}
-            return context
-    except Exception as e:
-        logger.error(f"Failed to fetch flood context: {e}")
-
-    return "Current flood data temporarily unavailable."
-
-
-def get_system_prompt(language: str = "en") -> str:
-    """Build the system prompt with identical structure for caching."""
-    
-    # Use asyncio.run only once at module level - we'll pass context as parameter
-    prompt = f"""You are NIHSA FloodAI, the official AI assistant for Nigeria's National Hydrological Services Agency (NIHSA) Flood Intelligence Platform.
-
-Your purpose: Help Nigerian citizens understand flood risks, navigate the app, report flooding, and stay safe.
-
-STRICT SCOPE: You ONLY respond to questions about:
-- Floods, flooding, inundation, flood forecasts, flood risk
-- Rivers, gauges, water levels, river basins in Nigeria
-- Hydrology, water resources, rainfall, runoff, drainage
-- Dams, reservoirs, discharge (especially Lagdo Dam)
-- Flood alerts, early warning, emergency flood response, evacuation
-- Water quality from flooding, NIHSA operations and monitoring
-
-If a question is NOT about these topics, reply ONLY:
-"I'm NIHSA AI, a specialist hydrological assistant. I can only answer questions about floods, rivers, water levels, and related topics in Nigeria."
-
-Never engage with general knowledge, coding, politics, entertainment or any non-hydrological topic.
-
-CAPABILITIES:
-- Answer questions about flood conditions anywhere in Nigeria
-- Guide users through reporting floods using the app
-- Help navigate to different sections (Map, Dashboard, Alerts, Vanguard chat, Assistant)
-- Provide safety recommendations based on current flood alerts
-- Explain how to use app features through tutorials
-
-RESPONSE GUIDELINES:
-- Respond in the SAME language the user writes in (English, Hausa, Yoruba, Igbo, or French)
-- Be concise and actionable - give one clear instruction per response
-- Be appropriately urgent when flood conditions are dangerous
-- For navigation requests, ALWAYS call the appropriate function (don't just describe)
-- For tutorial requests, ALWAYS call show_tutorial function
-- For "how do I report" questions, call navigate_to_report function
-- When user wants to see floods in a location, call search_location AND navigate_to_tab(map)
-
-DATA INTEGRITY RULES (CRITICAL — MUST FOLLOW):
-- NEVER invent, fabricate, assume, or extrapolate any specific water levels, flood status, or station readings.
-- ONLY reference stations, values, or locations that are explicitly present in the context data provided.
-- If no gauge data is available, say: "I don't have current gauge readings available. Please check the NIHSA dashboard for the latest data."
-- If a specific location is asked about but is not in the context data, say: "I don't have current data for [location]. I can only report on stations with data in the system."
-- Do NOT use phrases like "Lokoja is currently at SEVERE" unless it is explicitly in the provided context data.
-
-Remember: Your responses should be helpful, accurate, and potentially life-saving. Always prioritize safety."""
-
-    return prompt
-
-
-
-    
-async def detect_language_deepseek(text: str) -> str:
-    """Use DeepSeek to detect language (very cheap, fast)."""
-    try:
-        response = await deepseek_client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[
-                {"role": "system",
-                 "content": "Identify the language of this text. Reply with ONLY the ISO code: en, ha, yo, ig, or fr. No other text."},
-                {"role": "user", "content": text[:200]}
-            ],
-            max_tokens=5,
-            temperature=0
-        )
-        lang = response.choices[0].message.content.strip().lower()
-        if lang in ["en", "ha", "yo", "ig", "fr"]:
-            return lang
-    except Exception as e:
-        logger.warning(f"Language detection failed: {e}")
-    return "en"
-
-
-def detect_language_keywords(text: str) -> str:
-    """Fallback: keyword-based language detection."""
-    text_lower = text.lower()
-
-    # Hausa keywords
-    ha_keywords = ["ina", "so", "yi", "zan", "kana", "zaka", "da", "don", "abin", "wani", "wata"]
-    if any(kw in text_lower for kw in ha_keywords):
-        return "ha"
-
-    # Yoruba keywords
-    yo_keywords = ["mo", "fe", "lati", "se", "nko", "bawo", "ti", "won", "awon", "fun"]
-    if any(kw in text_lower for kw in yo_keywords):
-        return "yo"
-
-    # Igbo keywords
-    ig_keywords = ["m", "choro", "ime", "ka", "ndi", "nke", "onye", "ihe", "ga"]
-    if any(kw in text_lower for kw in ig_keywords):
-        return "ig"
-
-    # French keywords
-    fr_keywords = ["je", "veux", "suis", "comment", "quoi", "pour", "avec", "dans"]
-    if any(kw in text_lower for kw in fr_keywords):
-        return "fr"
-
-    return "en"
-
-
-# ============================================================================
-# CLOUDFLARE WHISPER TRANSCRIPTION (Replaces local Whisper)
-# ============================================================================
-
-async def transcribe_audio_cloudflare(audio_data: bytes) -> Tuple[str, str, float]:
-    """
-    Transcribe audio using Cloudflare Worker proxy.
-    Sends raw binary body to the Worker, which forwards to Whisper.
-    """
-    logger.info(f"Received audio: {len(audio_data)} bytes")
-    try:
-        response = await http_client.post(
-            CLOUDFLARE_WORKER_URL,
-            content=audio_data,
-            headers={"Content-Type": "audio/webm"},
-        )
-        if response.status_code != 200:
-            logger.error(f"Worker error (HTTP {response.status_code}): {response.text}")
-            raise Exception(f"Transcription failed: HTTP {response.status_code}")
-        data = response.json()
-        if not data.get("success", False):
-            raise Exception(f"Cloudflare error: {data.get('error', 'Unknown error')}")
-        text = data.get("text", "").strip()
-        if not text:
-            logger.warning("No text detected in audio")
-            return "", "en", 0.0
-        detected_lang = data.get("language", "en")
-        lang_map = {"en": "en", "english": "en", "ha": "ha", "hausa": "ha",
-                    "yo": "yo", "yoruba": "yo", "ig": "ig", "igbo": "ig",
-                    "fr": "fr", "french": "fr"}
-        detected_lang = lang_map.get(detected_lang.lower() if detected_lang else "en", "en")
-        logger.info(f"✅ Transcription successful via Worker: '{text[:50]}' ({detected_lang})")
-        return text, detected_lang, 0.95
-    except Exception as e:
-        logger.error(f"Transcription via Worker failed: {e}")
-        raise
-
-# ============================================================================
-# GOOGLE TTS (with disk caching) - UNCHANGED
-# ============================================================================
-
-def get_tts_client():
-    """Get or lazy-load Google TTS client."""
-    global _tts_client
-    if _tts_client is None:
-        _tts_client = texttospeech.TextToSpeechClient()
-    return _tts_client
-
-
-def get_tts_cache_key(text: str, language: str) -> str:
-    """Generate cache key for TTS."""
-    # Map language to voice
-    voice_map = {
-        "en": "en-US-Wavenet-D",
-        "ha": "en-US-Wavenet-D",
-        "yo": "en-US-Wavenet-D",
-        "ig": "en-US-Wavenet-D",
-        "fr": "fr-FR-Wavenet-D"
-    }
-    voice = voice_map.get(language, "en-US-Wavenet-D")
-    cache_str = f"{text}|{language}|{voice}"
-    return hashlib.md5(cache_str.encode()).hexdigest()
-
-
-async def synthesize_speech(text: str, language: str) -> bytes:
-    """
-    Synthesize speech using Google TTS with disk caching.
-    Returns MP3 audio bytes.
-    """
-    cache_key = get_tts_cache_key(text, language)
-    cache_path = TTS_CACHE_DIR / f"{cache_key}.mp3"
-
-    # Check cache
-    if cache_path.exists():
-        # Check if cache is less than 30 days old
-        mtime = datetime.fromtimestamp(cache_path.stat().st_mtime)
-        if datetime.now() - mtime < timedelta(days=30):
-            logger.info(f"TTS cache hit: {cache_key[:8]}")
-            return cache_path.read_bytes()
-
-    # Voice mapping
-    voice_map = {
-        "en": ("en-US-Wavenet-D", "en-US"),
-        "ha": ("en-US-Wavenet-D", "en-US"),
-        "yo": ("en-US-Wavenet-D", "en-US"),
-        "ig": ("en-US-Wavenet-D", "en-US"),
-        "fr": ("fr-FR-Wavenet-D", "fr-FR")
-    }
-
-    voice_name, language_code = voice_map.get(language, ("en-US-Wavenet-D", "en-US"))
-
-    # Limit text length (Google TTS limit is 5000 bytes)
-    if len(text.encode()) > 4500:
-        text = text[:2000] + "..."
-
-    client = get_tts_client()
-
-    synthesis_input = texttospeech.SynthesisInput(text=text)
-
-    voice = texttospeech.VoiceSelectionParams(
-        language_code=language_code,
-        name=voice_name
-    )
-
-    audio_config = texttospeech.AudioConfig(
-        audio_encoding=texttospeech.AudioEncoding.MP3,
-        speaking_rate=1.0,
-        pitch=0.0
-    )
-
-    try:
-        response = client.synthesize_speech(
-            input=synthesis_input,
-            voice=voice,
-            audio_config=audio_config
-        )
-
-        audio_bytes = response.audio_content
-
-        # Save to cache
-        cache_path.write_bytes(audio_bytes)
-        logger.info(f"TTS cached: {cache_key[:8]}")
-
-        return audio_bytes
-
-    except Exception as e:
-        logger.error(f"TTS synthesis failed: {e}")
-        raise
-
-
-# ============================================================================
-# LIFESPAN EVENTS
-# ============================================================================
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Startup and shutdown events."""
-    logger.info("Starting NIHSA AI Wrapper Service (Cloudflare Whisper mode)")
-
-    # Pre-warm DeepSeek
-    asyncio.create_task(prewarm_deepseek())
-
-    yield
-
-    # Shutdown
-    await http_client.aclose()
-    logger.info("Shutdown complete")
-
-
-async def prewarm_deepseek():
-    """Pre-warm DeepSeek with dummy call."""
-    try:
-        logger.info("Pre-warming DeepSeek with dummy call...")
-        await deepseek_client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[{"role": "user", "content": "ping"}],
-            max_tokens=5
-        )
-        logger.info("DeepSeek pre-warmed")
-    except Exception as e:
-        logger.warning(f"DeepSeek pre-warm failed: {e}")
-
 
 # ============================================================================
 # FASTAPI APP
 # ============================================================================
 
-app = FastAPI(title="NIHSA AI Wrapper", version="2.0.0", lifespan=lifespan)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("NIHSA AI Wrapper starting — Cloudflare STT + MeloTTS")
+    yield
+    logger.info("NIHSA AI Wrapper shutting down")
+
+app = FastAPI(
+    title="NIHSA AI Assistant Wrapper",
+    description="Flood intelligence AI with Cloudflare STT/TTS — Nigeria Hydrological Services Agency",
+    lifespan=lifespan,
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -916,172 +1065,160 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-async def verify_user_with_main_backend(auth_header: str) -> Optional[Dict]:
-    """
-    Verify the user token by calling the main NIHSA backend.
-    Returns user data if valid, None otherwise.
-    """
-    if not auth_header or not auth_header.startswith("Bearer "):
-        return None
-    
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(
-                f"{NIHSA_API_URL}/auth/me",
-                headers={"Authorization": auth_header}
-            )
-            
-            if response.status_code == 200:
-                return response.json()
-            else:
-                logger.warning(f"Token verification failed: {response.status_code}")
-                return None
-                
-    except Exception as e:
-        logger.error(f"Failed to verify user with main backend: {e}")
-        return None
+# ============================================================================
+# ENDPOINTS
+# ============================================================================
 
-
-# Updated quota check function
-def get_user_quota(user_data: Dict) -> tuple:
-    """
-    Get quota limits based on user role from main backend.
-    Returns: (limit: int, role: str)
-    """
-    role = user_data.get("role", "citizen").lower()
-    
-    QUOTA_LIMITS = {
-        "admin": 20,
-        "sub_admin": 15,
-        "nihsa_staff": 10,
-        "government": 10,
-        "researcher": 10,
-        "vanguard": 7,
-        "citizen": 5,
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "healthy",
+        "stt_provider": "Cloudflare Workers AI — whisper-large-v3-turbo",
+        "tts_provider": "Cloudflare Workers AI — MeloTTS (no Google credentials needed)",
+        "llm_provider": "DeepSeek Chat",
+        "whisper_improvements": ["vad_filter", "hydrology_prompt", "beam_count=5", "no_hallucination_loop"],
     }
-    
-    limit = QUOTA_LIMITS.get(role, 5)
-    return limit, role
 
-# Store user daily usage: user_id -> {"count": int, "date": date, "role": str}
-user_daily_usage: Dict[str, Dict] = defaultdict(lambda: {"count": 0, "date": None, "role": "citizen"})
 
-QUOTA_LIMITS = {
-    "admin": 20,
-    "sub_admin": 15,
-    "nihsa_staff": 10,
-    "government": 10,
-    "researcher": 10,
-    "vanguard": 7,
-    "citizen": 5,
-}
-
-def check_daily_quota(user_id: str, role: str = "citizen") -> Tuple[bool, int, int]:
+@app.post("/ai/transcribe", response_model=TranscribeResponse)
+async def transcribe_audio_endpoint(
+    request: Request,
+    audio: UploadFile = File(...),
+    session_id: str = Form(default="default"),
+):
     """
-    Check if user has remaining daily prompts.
-    Returns: (allowed, remaining, limit)
+    Transcribe audio to text using Cloudflare Whisper Large v3 Turbo.
+    Improvements: hydrology context prompt, VAD, beam_count=5.
     """
-    today = datetime.now().date()
-    usage = user_daily_usage[user_id]
-    
-    # Reset if new day
-    if usage["date"] != today:
-        usage["count"] = 0
-        usage["date"] = today
-        usage["role"] = role
-    
-    limit = QUOTA_LIMITS.get(role, 5)
-    remaining = max(0, limit - usage["count"])
-    
-    if usage["count"] >= limit:
-        return False, 0, limit
-    
-    return True, remaining, limit
+    if not check_rate_limit(session_id):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded. Please wait.")
 
-def increment_usage(user_id: str, role: str = "citizen"):
-    """Increment the daily usage count for a user."""
-    today = datetime.now().date()
-    usage = user_daily_usage[user_id]
-    
-    if usage["date"] != today:
-        usage["count"] = 1
-        usage["date"] = today
-        usage["role"] = role
-    else:
-        usage["count"] += 1
+    audio_data = await audio.read()
+    if len(audio_data) == 0:
+        raise HTTPException(status_code=400, detail="Empty audio file")
+    if len(audio_data) > 24 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Audio file too large (max 24MB). Please record a shorter clip.")
+
+    try:
+        text, detected_lang, confidence = await transcribe_audio_cloudflare(audio_data)
+        if not text:
+            raise HTTPException(status_code=400, detail="No speech detected. Please try again in a quiet environment.")
+        return TranscribeResponse(text=text, detected_language=detected_lang, confidence=confidence)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Transcription error: {e}")
+        raise HTTPException(status_code=500, detail="Transcription failed. Please use text input instead.")
 
 
-# Updated chat endpoint
 @app.post("/ai/chat", response_model=ChatResponse)
-async def chat_endpoint(request: ChatRequest, req: Request):
+async def chat_endpoint(request: Request, body: ChatRequest):
     """
-    Chat with DeepSeek AI with function calling.
-    Requires authentication via main backend.
+    Chat with DeepSeek using a rich NIHSA hydrology system prompt.
+    Includes live flood context from the NIHSA backend.
     """
-    # Get auth header from incoming request
-    auth_header = req.headers.get("Authorization", "")
-    
-    # Verify user with main backend
+    auth_header = request.headers.get("Authorization", "")
     user_data = await verify_user_with_main_backend(auth_header)
-    
+
     if not user_data:
         raise HTTPException(
             status_code=401,
             detail="Authentication required. Please sign in to use the AI assistant."
         )
-    
-    user_id = user_data.get("id", request.session_id)
+
+    user_id = user_data.get("id", body.session_id)
     limit, role = get_user_quota(user_data)
-    
-    # Check daily quota
+
     allowed, remaining, _ = check_daily_quota(user_id, role)
     if not allowed:
         raise HTTPException(
             status_code=429,
-            detail=f"Daily limit of {limit} prompts reached. Your quota will reset tomorrow."
+            detail=f"Daily limit of {limit} prompts reached. Your quota resets tomorrow."
         )
-    
-    # Rate limiting for abuse prevention (per-minute)
-    if not check_rate_limit(f"{user_id}_{request.session_id}", limit=10, window=60):
-        raise HTTPException(status_code=429, detail="Rate limit exceeded. Please wait.")
-    
-    # Get or detect language
-    language = request.language
-    if not language and request.messages:
-        last_msg = request.messages[-1].content
+
+    if not check_rate_limit(f"{user_id}_{body.session_id}", limit=10, window=60):
+        raise HTTPException(status_code=429, detail="Too many requests. Please wait a moment.")
+
+    # Detect language
+    language = body.language
+    if not language and body.messages:
+        last_msg = body.messages[-1].content
         language = await detect_language_deepseek(last_msg)
         if language == "en":
             language = detect_language_keywords(last_msg)
-    
     language = language or "en"
-    
-    # Get system prompt with live flood context
+
+    # ── Build flood context from what the frontend sends ──────────────────────
+    # The frontend already holds the real verified alerts fetched from the DB.
+    # Using these is more reliable than the wrapper making a second API call,
+    # and it means the AI sees exactly what the user sees on screen.
+    if body.active_alerts is not None:
+        if body.active_alerts:
+            critical = [a for a in body.active_alerts if a.get("level") in ("CRITICAL", "HIGH", "EXTREME")]
+            flood_context = (
+                f"ACTIVE VERIFIED ALERTS (from NIHSA database, confirmed by coordinators): "
+                f"{len(body.active_alerts)} total, {len(critical)} critical/high/extreme.\n"
+            )
+            for a in body.active_alerts[:8]:
+                flood_context += f"  ⚠ [{a.get('level','')}] {a.get('title','')} — {a.get('state','')}"
+                lgas = a.get("lgas") or []
+                if lgas:
+                    flood_context += f" (LGAs: {', '.join(lgas[:4])})"
+                msg_snippet = (a.get("message") or "")[:120]
+                if msg_snippet:
+                    flood_context += f"\n    → {msg_snippet}"
+                flood_context += "\n"
+        else:
+            flood_context = "ACTIVE ALERTS: None at this time. All published NIHSA alerts have been resolved."
+    else:
+        # Fallback: fetch from backend if frontend didn't send alerts
+        flood_context = await fetch_flood_context()
+
+    # ── Location context: personalise advice to the user's area ───────────────
+    location_context = ""
+    if body.user_location:
+        loc = body.user_location
+        lat = loc.get("lat")
+        lng = loc.get("lng")
+        address = loc.get("address", "")
+        coords = f"{lat:.4f}°N, {lng:.4f}°E" if lat and lng else "unknown"
+        location_context = (
+            f"\nUSER'S CURRENT LOCATION: {address} ({coords})\n"
+            f"CRITICAL INSTRUCTION: Tailor all flood risk information specifically to this location. "
+            f"Check if any of the active alerts above affect this state or its LGAs. "
+            f"If alerts exist near the user's location, lead with that information immediately. "
+            f"If no nearby alerts, say so clearly and advise on seasonal risk for their region of Nigeria."
+        )
+
     system_prompt = get_system_prompt(language)
-    flood_context = await fetch_flood_context()
-    full_system_prompt = f"{system_prompt}\n\nCURRENT FLOOD CONTEXT (Live from NIHSA):\n{flood_context}"
-    
-    # Build messages for DeepSeek
-    messages = [{"role": "system", "content": full_system_prompt}]
-    
-    for msg in request.messages[-10:]:
+    role_label = ROLE_LABELS.get(role, "User")
+
+    full_system = (
+        f"{system_prompt}\n\n"
+        f"USER CONTEXT:\n"
+        f"  Role: {role_label}\n"
+        f"  Prompts remaining today: {remaining}/{limit}\n"
+        f"{location_context}\n\n"
+        f"LIVE NIHSA SITUATION REPORT:\n{flood_context}"
+    )
+
+    messages = [{"role": "system", "content": full_system}]
+    for msg in body.messages[-10:]:
         messages.append({"role": msg.role, "content": msg.content})
-    
+
     try:
         response = await deepseek_client.chat.completions.create(
             model="deepseek-chat",
             messages=messages,
             tools=TOOLS,
             tool_choice="auto",
-            max_tokens=500,
-            temperature=0.7
+            max_tokens=600,
+            temperature=0.5,  # Lower = more factual, less hallucination
         )
-        
+
         message = response.choices[0].message
-        
-        # Increment usage AFTER successful response
         increment_usage(user_id, role)
-        
-        # Check for function call
+
         action = None
         if message.tool_calls:
             tool_call = message.tool_calls[0]
@@ -1089,51 +1226,65 @@ async def chat_endpoint(request: ChatRequest, req: Request):
                 "type": tool_call.function.name,
                 "params": json.loads(tool_call.function.arguments)
             }
-            reply = f"Let me help you with that."
+            reply = "Let me help you with that."
         else:
-            reply = message.content or "I'm here to help with flood safety information."
-        
-        return ChatResponse(
-            reply=reply,
-            action=action,
-            detected_language=language
-        )
-    
+            reply = message.content or "I'm here to help with flood safety. Please ask a hydrology-related question."
+
+        return ChatResponse(reply=reply, action=action, detected_language=language)
+
     except Exception as e:
         logger.error(f"DeepSeek error: {e}")
-        raise HTTPException(status_code=503, detail="AI service temporarily unavailable.")
+        raise HTTPException(status_code=503, detail="AI service temporarily unavailable. Please try again.")
+
+
+@app.post("/ai/speak")
+async def speak_endpoint(
+    text: str = Form(...),
+    language: str = Form(default="en"),
+    session_id: str = Form(default="default"),
+):
+    """
+    Convert text to speech using Cloudflare MeloTTS.
+    No Google credentials required — uses your existing Cloudflare API token.
+    Supported natively: en, fr. ha/yo/ig fall back to English voice.
+    Returns MP3 audio.
+    """
+    if not check_rate_limit(session_id, limit=30):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded.")
+
+    if len(text) > 1000:
+        text = text[:1000]
+
+    try:
+        audio_bytes = await synthesize_speech(text, language)
+        return StreamingResponse(
+            iter([audio_bytes]),
+            media_type="audio/mpeg",
+            headers={"Content-Disposition": "inline"},
+        )
+    except Exception as e:
+        logger.error(f"TTS error: {e}")
+        raise HTTPException(status_code=503, detail="Text-to-speech temporarily unavailable.")
 
 
 @app.get("/ai/quota")
 async def get_quota(req: Request):
-    """
-    Get remaining daily prompts for authenticated user.
-    """
+    """Get remaining daily prompts for authenticated user."""
     auth_header = req.headers.get("Authorization", "")
-    print(f"🔍 Quota request - Auth header present: {bool(auth_header)}")
-    
     user_data = await verify_user_with_main_backend(auth_header)
-    print(f"🔍 User data from main backend: {user_data}")
-    
+
     if not user_data:
         return {
-            "remaining": 0,
-            "limit": 0,
-            "authenticated": False,
-            "role": None,
+            "remaining": 0, "limit": 0,
+            "authenticated": False, "role": None,
             "reset_at": (datetime.now().date() + timedelta(days=1)).isoformat()
         }
-    
+
     user_id = user_data.get("id", "unknown")
     role = user_data.get("role", "citizen").lower()
-    print(f"🔍 User ID: {user_id}, Role: {role}")
-    
     limit = QUOTA_LIMITS.get(role, 5)
-    print(f"🔍 Quota limit for role '{role}': {limit}")
-    
     allowed, remaining, _ = check_daily_quota(user_id, role)
-    print(f"🔍 Allowed: {allowed}, Remaining: {remaining}")
-    
+
     return {
         "remaining": remaining if allowed else 0,
         "limit": limit,
@@ -1143,118 +1294,28 @@ async def get_quota(req: Request):
     }
 
 
-# ============================================================================
-# ENDPOINTS
-# ============================================================================
-
-@app.get("/health")
-async def health_check():
-    """Health check endpoint."""
-    return {
-        "status": "healthy",
-        "stt_provider": "Cloudflare Workers AI",
-        "whisper_model": "whisper-large-v3-turbo"
-    }
-
-
-@app.post("/ai/transcribe", response_model=TranscribeResponse)
-async def transcribe_audio_endpoint(
-        request: Request,
-        audio: UploadFile = File(...),
-        session_id: str = Form(default="default")
-):
-    """
-    Transcribe audio to text using Cloudflare Whisper.
-    Accepts WebM audio from frontend MediaRecorder.
-    """
-    # Rate limiting
-    if not check_rate_limit(session_id):
-        raise HTTPException(status_code=429, detail="Rate limit exceeded. Please wait.")
-
-    try:
-        # Read audio data
-        audio_data = await audio.read()
-
-        if len(audio_data) == 0:
-            raise HTTPException(status_code=400, detail="Empty audio file")
-
-        # Transcribe using Cloudflare
-        text, detected_lang, confidence = await transcribe_audio_cloudflare(audio_data)
-
-        if not text:
-            raise HTTPException(status_code=400, detail="No speech detected")
-
-        return TranscribeResponse(
-            text=text,
-            detected_language=detected_lang,
-            confidence=confidence
-        )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Transcription error: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail="Transcription failed. Please try using text input instead."
-        )
-
-
-
-
-@app.post("/ai/speak")
-async def speak_endpoint(
-        text: str = Form(...),
-        language: str = Form(default="en"),
-        session_id: str = Form(default="default")
-):
-    """
-    Convert text to speech using Google TTS.
-    Returns MP3 audio.
-    """
-    # Rate limiting
-    if not check_rate_limit(session_id, limit=30):
-        raise HTTPException(status_code=429, detail="Rate limit exceeded.")
-
-    try:
-        audio_bytes = await synthesize_speech(text, language)
-
-        return StreamingResponse(
-            iter([audio_bytes]),
-            media_type="audio/mpeg",
-            headers={"Content-Disposition": "inline"}
-        )
-
-    except Exception as e:
-        logger.error(f"TTS error: {e}")
-        raise HTTPException(status_code=503, detail="Text-to-speech unavailable.")
-
-
 @app.get("/ai/tutorials/{topic}", response_model=TutorialResponse)
 async def get_tutorial(topic: str, lang: str = "en"):
     """
     Get tutorial content for a topic in the specified language.
+    All content is accurate to the real NIHSA app and available in all 5 languages.
     """
     if topic not in TUTORIALS:
-        raise HTTPException(status_code=404, detail="Tutorial not found")
+        raise HTTPException(status_code=404, detail=f"Tutorial topic '{topic}' not found.")
 
-    if lang not in TUTORIALS[topic]:
-        lang = "en"  # Fallback to English
+    topic_data = TUTORIALS[topic]
+    # Fall back to English if requested language not available
+    if lang not in topic_data:
+        lang = "en"
 
-    tutorial = TUTORIALS[topic][lang]
-
+    content = topic_data[lang]
     return TutorialResponse(
-        title=tutorial["title"],
-        steps=tutorial["steps"],
-        language=lang
+        title=content["title"],
+        steps=content["steps"],
+        language=lang,
     )
 
 
-# ============================================================================
-# MAIN ENTRY POINT
-# ============================================================================
-
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(app, host="0.0.0.0", port=8000)
