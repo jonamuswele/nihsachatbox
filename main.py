@@ -745,61 +745,33 @@ def detect_language_keywords(text: str) -> str:
 
 async def transcribe_audio_cloudflare(audio_data: bytes) -> Tuple[str, str, float]:
     """
-    Transcribe audio using Cloudflare API directly with base64.
+    Transcribe audio using Cloudflare Worker proxy.
+    Sends raw binary body to the Worker, which forwards to Whisper.
     """
-    import base64
-    
     logger.info(f"Received audio: {len(audio_data)} bytes")
-    
-    # Convert to base64 string
-    audio_base64 = base64.b64encode(audio_data).decode('utf-8')
-    
     try:
         response = await http_client.post(
-            f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/@cf/openai/whisper",
-            headers={
-                "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
-            },
-            files={
-                "audio": ("audio.webm", audio_data, "audio/webm")
-            },
-            data={
-                "task": "transcribe"
-            }
+            CLOUDFLARE_WORKER_URL,
+            content=audio_data,
+            headers={"Content-Type": "audio/webm"},
         )
-
         if response.status_code != 200:
             logger.error(f"Worker error (HTTP {response.status_code}): {response.text}")
             raise Exception(f"Transcription failed: HTTP {response.status_code}")
-
         data = response.json()
-
         if not data.get("success", False):
-            error_msg = data.get("error", "Unknown error")
-            logger.error(f"Worker returned error: {error_msg}")
-            raise Exception(f"Cloudflare error: {error_msg}")
-
+            raise Exception(f"Cloudflare error: {data.get('error', 'Unknown error')}")
         text = data.get("text", "").strip()
-        
         if not text:
             logger.warning("No text detected in audio")
             return "", "en", 0.0
-        
-        # Get detected language
         detected_lang = data.get("language", "en")
-        lang_map = {
-            "en": "en", "english": "en",
-            "ha": "ha", "hausa": "ha",
-            "yo": "yo", "yoruba": "yo",
-            "ig": "ig", "igbo": "ig",
-            "fr": "fr", "french": "fr"
-        }
+        lang_map = {"en": "en", "english": "en", "ha": "ha", "hausa": "ha",
+                    "yo": "yo", "yoruba": "yo", "ig": "ig", "igbo": "ig",
+                    "fr": "fr", "french": "fr"}
         detected_lang = lang_map.get(detected_lang.lower() if detected_lang else "en", "en")
-        
-        logger.info(f"✅ Transcription successful via Worker: '{text[:50]}...' ({detected_lang})")
-        
+        logger.info(f"✅ Transcription successful via Worker: '{text[:50]}' ({detected_lang})")
         return text, detected_lang, 0.95
-
     except Exception as e:
         logger.error(f"Transcription via Worker failed: {e}")
         raise
