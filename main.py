@@ -1090,7 +1090,10 @@ async def get_quota(req: Request):
     Get remaining daily prompts for authenticated user.
     """
     auth_header = req.headers.get("Authorization", "")
+    print(f"🔍 Quota request - Auth header present: {bool(auth_header)}")
+    
     user_data = await verify_user_with_main_backend(auth_header)
+    print(f"🔍 User data from main backend: {user_data}")
     
     if not user_data:
         return {
@@ -1102,8 +1105,14 @@ async def get_quota(req: Request):
         }
     
     user_id = user_data.get("id", "unknown")
-    limit, role = get_user_quota(user_data)
+    role = user_data.get("role", "citizen").lower()
+    print(f"🔍 User ID: {user_id}, Role: {role}")
+    
+    limit = QUOTA_LIMITS.get(role, 5)
+    print(f"🔍 Quota limit for role '{role}': {limit}")
+    
     allowed, remaining, _ = check_daily_quota(user_id, role)
+    print(f"🔍 Allowed: {allowed}, Remaining: {remaining}")
     
     return {
         "remaining": remaining if allowed else 0,
