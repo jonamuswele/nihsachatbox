@@ -688,175 +688,7 @@ Remember: Your responses should be helpful, accurate, and potentially life-savin
     return prompt
 
 
-async def verify_user_with_main_backend(auth_header: str) -> Optional[Dict]:
-    """
-    Verify the user token by calling the main NIHSA backend.
-    Returns user data if valid, None otherwise.
-    """
-    if not auth_header or not auth_header.startswith("Bearer "):
-        return None
-    
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(
-                f"{NIHSA_API_URL}/auth/me",
-                headers={"Authorization": auth_header}
-            )
-            
-            if response.status_code == 200:
-                return response.json()
-            else:
-                logger.warning(f"Token verification failed: {response.status_code}")
-                return None
-                
-    except Exception as e:
-        logger.error(f"Failed to verify user with main backend: {e}")
-        return None
 
-
-# Updated quota check function
-def get_user_quota(user_data: Dict) -> tuple:
-    """
-    Get quota limits based on user role from main backend.
-    Returns: (limit: int, role: str)
-    """
-    role = user_data.get("role", "citizen").lower()
-    
-    QUOTA_LIMITS = {
-        "admin": 20,
-        "sub_admin": 15,
-        "nihsa_staff": 10,
-        "government": 10,
-        "researcher": 10,
-        "vanguard": 7,
-        "citizen": 5,
-    }
-    
-    limit = QUOTA_LIMITS.get(role, 5)
-    return limit, role
-
-
-# Updated chat endpoint
-@app.post("/ai/chat", response_model=ChatResponse)
-async def chat_endpoint(request: ChatRequest, req: Request):
-    """
-    Chat with DeepSeek AI with function calling.
-    Requires authentication via main backend.
-    """
-    # Get auth header from incoming request
-    auth_header = req.headers.get("Authorization", "")
-    
-    # Verify user with main backend
-    user_data = await verify_user_with_main_backend(auth_header)
-    
-    if not user_data:
-        raise HTTPException(
-            status_code=401,
-            detail="Authentication required. Please sign in to use the AI assistant."
-        )
-    
-    user_id = user_data.get("id", request.session_id)
-    limit, role = get_user_quota(user_data)
-    
-    # Check daily quota
-    allowed, remaining, _ = check_daily_quota(user_id, role)
-    if not allowed:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Daily limit of {limit} prompts reached. Your quota will reset tomorrow."
-        )
-    
-    # Rate limiting for abuse prevention (per-minute)
-    if not check_rate_limit(f"{user_id}_{request.session_id}", limit=10, window=60):
-        raise HTTPException(status_code=429, detail="Rate limit exceeded. Please wait.")
-    
-    # Get or detect language
-    language = request.language
-    if not language and request.messages:
-        last_msg = request.messages[-1].content
-        language = await detect_language_deepseek(last_msg)
-        if language == "en":
-            language = detect_language_keywords(last_msg)
-    
-    language = language or "en"
-    
-    # Get system prompt with live flood context
-    system_prompt = get_system_prompt(language)
-    flood_context = await fetch_flood_context()
-    full_system_prompt = f"{system_prompt}\n\nCURRENT FLOOD CONTEXT (Live from NIHSA):\n{flood_context}"
-    
-    # Build messages for DeepSeek
-    messages = [{"role": "system", "content": full_system_prompt}]
-    
-    for msg in request.messages[-10:]:
-        messages.append({"role": msg.role, "content": msg.content})
-    
-    try:
-        response = await deepseek_client.chat.completions.create(
-            model="deepseek-chat",
-            messages=messages,
-            tools=TOOLS,
-            tool_choice="auto",
-            max_tokens=500,
-            temperature=0.7
-        )
-        
-        message = response.choices[0].message
-        
-        # Increment usage AFTER successful response
-        increment_usage(user_id, role)
-        
-        # Check for function call
-        action = None
-        if message.tool_calls:
-            tool_call = message.tool_calls[0]
-            action = {
-                "type": tool_call.function.name,
-                "params": json.loads(tool_call.function.arguments)
-            }
-            reply = f"Let me help you with that."
-        else:
-            reply = message.content or "I'm here to help with flood safety information."
-        
-        return ChatResponse(
-            reply=reply,
-            action=action,
-            detected_language=language
-        )
-    
-    except Exception as e:
-        logger.error(f"DeepSeek error: {e}")
-        raise HTTPException(status_code=503, detail="AI service temporarily unavailable.")
-
-
-@app.get("/ai/quota")
-async def get_quota(req: Request):
-    """
-    Get remaining daily prompts for authenticated user.
-    """
-    auth_header = req.headers.get("Authorization", "")
-    user_data = await verify_user_with_main_backend(auth_header)
-    
-    if not user_data:
-        return {
-            "remaining": 0,
-            "limit": 0,
-            "authenticated": False,
-            "role": None,
-            "reset_at": (datetime.now().date() + timedelta(days=1)).isoformat()
-        }
-    
-    user_id = user_data.get("id", "unknown")
-    limit, role = get_user_quota(user_data)
-    allowed, remaining, _ = check_daily_quota(user_id, role)
-    
-    return {
-        "remaining": remaining if allowed else 0,
-        "limit": limit,
-        "authenticated": True,
-        "role": role,
-        "reset_at": (datetime.now().date() + timedelta(days=1)).isoformat()
-    }
     
 async def detect_language_deepseek(text: str) -> str:
     """Use DeepSeek to detect language (very cheap, fast)."""
@@ -1110,6 +942,176 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+async def verify_user_with_main_backend(auth_header: str) -> Optional[Dict]:
+    """
+    Verify the user token by calling the main NIHSA backend.
+    Returns user data if valid, None otherwise.
+    """
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return None
+    
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                f"{NIHSA_API_URL}/auth/me",
+                headers={"Authorization": auth_header}
+            )
+            
+            if response.status_code == 200:
+                return response.json()
+            else:
+                logger.warning(f"Token verification failed: {response.status_code}")
+                return None
+                
+    except Exception as e:
+        logger.error(f"Failed to verify user with main backend: {e}")
+        return None
+
+
+# Updated quota check function
+def get_user_quota(user_data: Dict) -> tuple:
+    """
+    Get quota limits based on user role from main backend.
+    Returns: (limit: int, role: str)
+    """
+    role = user_data.get("role", "citizen").lower()
+    
+    QUOTA_LIMITS = {
+        "admin": 20,
+        "sub_admin": 15,
+        "nihsa_staff": 10,
+        "government": 10,
+        "researcher": 10,
+        "vanguard": 7,
+        "citizen": 5,
+    }
+    
+    limit = QUOTA_LIMITS.get(role, 5)
+    return limit, role
+
+
+# Updated chat endpoint
+@app.post("/ai/chat", response_model=ChatResponse)
+async def chat_endpoint(request: ChatRequest, req: Request):
+    """
+    Chat with DeepSeek AI with function calling.
+    Requires authentication via main backend.
+    """
+    # Get auth header from incoming request
+    auth_header = req.headers.get("Authorization", "")
+    
+    # Verify user with main backend
+    user_data = await verify_user_with_main_backend(auth_header)
+    
+    if not user_data:
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required. Please sign in to use the AI assistant."
+        )
+    
+    user_id = user_data.get("id", request.session_id)
+    limit, role = get_user_quota(user_data)
+    
+    # Check daily quota
+    allowed, remaining, _ = check_daily_quota(user_id, role)
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Daily limit of {limit} prompts reached. Your quota will reset tomorrow."
+        )
+    
+    # Rate limiting for abuse prevention (per-minute)
+    if not check_rate_limit(f"{user_id}_{request.session_id}", limit=10, window=60):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded. Please wait.")
+    
+    # Get or detect language
+    language = request.language
+    if not language and request.messages:
+        last_msg = request.messages[-1].content
+        language = await detect_language_deepseek(last_msg)
+        if language == "en":
+            language = detect_language_keywords(last_msg)
+    
+    language = language or "en"
+    
+    # Get system prompt with live flood context
+    system_prompt = get_system_prompt(language)
+    flood_context = await fetch_flood_context()
+    full_system_prompt = f"{system_prompt}\n\nCURRENT FLOOD CONTEXT (Live from NIHSA):\n{flood_context}"
+    
+    # Build messages for DeepSeek
+    messages = [{"role": "system", "content": full_system_prompt}]
+    
+    for msg in request.messages[-10:]:
+        messages.append({"role": msg.role, "content": msg.content})
+    
+    try:
+        response = await deepseek_client.chat.completions.create(
+            model="deepseek-chat",
+            messages=messages,
+            tools=TOOLS,
+            tool_choice="auto",
+            max_tokens=500,
+            temperature=0.7
+        )
+        
+        message = response.choices[0].message
+        
+        # Increment usage AFTER successful response
+        increment_usage(user_id, role)
+        
+        # Check for function call
+        action = None
+        if message.tool_calls:
+            tool_call = message.tool_calls[0]
+            action = {
+                "type": tool_call.function.name,
+                "params": json.loads(tool_call.function.arguments)
+            }
+            reply = f"Let me help you with that."
+        else:
+            reply = message.content or "I'm here to help with flood safety information."
+        
+        return ChatResponse(
+            reply=reply,
+            action=action,
+            detected_language=language
+        )
+    
+    except Exception as e:
+        logger.error(f"DeepSeek error: {e}")
+        raise HTTPException(status_code=503, detail="AI service temporarily unavailable.")
+
+
+@app.get("/ai/quota")
+async def get_quota(req: Request):
+    """
+    Get remaining daily prompts for authenticated user.
+    """
+    auth_header = req.headers.get("Authorization", "")
+    user_data = await verify_user_with_main_backend(auth_header)
+    
+    if not user_data:
+        return {
+            "remaining": 0,
+            "limit": 0,
+            "authenticated": False,
+            "role": None,
+            "reset_at": (datetime.now().date() + timedelta(days=1)).isoformat()
+        }
+    
+    user_id = user_data.get("id", "unknown")
+    limit, role = get_user_quota(user_data)
+    allowed, remaining, _ = check_daily_quota(user_id, role)
+    
+    return {
+        "remaining": remaining if allowed else 0,
+        "limit": limit,
+        "authenticated": True,
+        "role": role,
+        "reset_at": (datetime.now().date() + timedelta(days=1)).isoformat()
+    }
 
 
 # ============================================================================
