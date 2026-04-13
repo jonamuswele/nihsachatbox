@@ -26,6 +26,7 @@ from pydantic import BaseModel, Field
 from openai import AsyncOpenAI
 from google.cloud import texttospeech
 from cachetools import TTLCache
+from typing import Optional, Dict, List, Any, Tuple
 
 # ============================================================================
 # CONFIGURATION & ENVIRONMENT
@@ -990,6 +991,53 @@ def get_user_quota(user_data: Dict) -> tuple:
     limit = QUOTA_LIMITS.get(role, 5)
     return limit, role
 
+# Store user daily usage: user_id -> {"count": int, "date": date, "role": str}
+user_daily_usage: Dict[str, Dict] = defaultdict(lambda: {"count": 0, "date": None, "role": "citizen"})
+
+QUOTA_LIMITS = {
+    "admin": 20,
+    "sub_admin": 15,
+    "nihsa_staff": 10,
+    "government": 10,
+    "researcher": 10,
+    "vanguard": 7,
+    "citizen": 5,
+}
+
+def check_daily_quota(user_id: str, role: str = "citizen") -> Tuple[bool, int, int]:
+    """
+    Check if user has remaining daily prompts.
+    Returns: (allowed, remaining, limit)
+    """
+    today = datetime.now().date()
+    usage = user_daily_usage[user_id]
+    
+    # Reset if new day
+    if usage["date"] != today:
+        usage["count"] = 0
+        usage["date"] = today
+        usage["role"] = role
+    
+    limit = QUOTA_LIMITS.get(role, 5)
+    remaining = max(0, limit - usage["count"])
+    
+    if usage["count"] >= limit:
+        return False, 0, limit
+    
+    return True, remaining, limit
+
+def increment_usage(user_id: str, role: str = "citizen"):
+    """Increment the daily usage count for a user."""
+    today = datetime.now().date()
+    usage = user_daily_usage[user_id]
+    
+    if usage["date"] != today:
+        usage["count"] = 1
+        usage["date"] = today
+        usage["role"] = role
+    else:
+        usage["count"] += 1
+
 
 # Updated chat endpoint
 @app.post("/ai/chat", response_model=ChatResponse)
@@ -1180,74 +1228,6 @@ async def transcribe_audio_endpoint(
         )
 
 
-@app.post("/ai/chat", response_model=ChatResponse)
-async def chat_endpoint(request: ChatRequest):
-    """
-    Chat with DeepSeek AI with function calling.
-    """
-    # Rate limiting
-    if not check_rate_limit(request.session_id):
-        raise HTTPException(status_code=429, detail="Rate limit exceeded. Please wait.")
-
-    # Get or detect language
-    language = request.language
-    if not language and request.messages:
-        last_msg = request.messages[-1].content
-        # Try DeepSeek detection first
-        language = await detect_language_deepseek(last_msg)
-        if language == "en":
-            # Try keyword fallback
-            language = detect_language_keywords(last_msg)
-
-    language = language or "en"
-
-    # Get system prompt with live flood context
-    system_prompt = get_system_prompt(language)
-    
-    # Add flood context to system prompt
-    flood_context = await fetch_flood_context()
-    full_system_prompt = f"{system_prompt}\n\nCURRENT FLOOD CONTEXT (Live from NIHSA):\n{flood_context}"
-
-    # Build messages for DeepSeek
-    messages = [{"role": "system", "content": full_system_prompt}]
-
-    # Add conversation history
-    for msg in request.messages[-10:]:  # Last 10 messages
-        messages.append({"role": msg.role, "content": msg.content})
-
-    try:
-        response = await deepseek_client.chat.completions.create(
-            model="deepseek-chat",
-            messages=messages,
-            tools=TOOLS,
-            tool_choice="auto",
-            max_tokens=500,
-            temperature=0.7
-        )
-
-        message = response.choices[0].message
-
-        # Check for function call
-        action = None
-        if message.tool_calls:
-            tool_call = message.tool_calls[0]
-            action = {
-                "type": tool_call.function.name,
-                "params": json.loads(tool_call.function.arguments)
-            }
-            reply = f"Let me help you with that."
-        else:
-            reply = message.content or "I'm here to help with flood safety information."
-
-        return ChatResponse(
-            reply=reply,
-            action=action,
-            detected_language=language
-        )
-
-    except Exception as e:
-        logger.error(f"DeepSeek error: {e}")
-        raise HTTPException(status_code=503, detail="AI service temporarily unavailable.")
 
 
 @app.post("/ai/speak")
