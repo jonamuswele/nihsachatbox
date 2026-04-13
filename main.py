@@ -98,13 +98,13 @@ class TutorialResponse(BaseModel):
 # ============================================================================
 
 QUOTA_LIMITS = {
-    "citizen":     5,
-    "vanguard":    10,
-    "researcher":  20,
-    "government":  20,
-    "nihsa_staff": 50,
-    "sub_admin":   50,
-    "admin":       999,
+    "citizen":     7,
+    "vanguard":    7,
+    "researcher":  7,
+    "government":  7,
+    "nihsa_staff": 7,
+    "sub_admin":   7,
+    "admin":       100,
 }
 
 # Rate limiting stays in-memory (per-minute window, resets are fine)
