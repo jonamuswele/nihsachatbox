@@ -756,12 +756,13 @@ async def transcribe_audio_cloudflare(audio_data: bytes) -> Tuple[str, str, floa
             f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/@cf/openai/whisper",
             headers={
                 "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
-                "Content-Type": "application/json"
             },
-            json={
-                "audio": audio_base64
+            files={
+                "audio": ("audio.webm", audio_data, "audio/webm")
             },
-            timeout=60.0
+            data={
+                "task": "transcribe"
+            }
         )
 
         if response.status_code != 200:
