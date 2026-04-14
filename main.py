@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+
 import os
 import sys
 import json
@@ -98,13 +99,13 @@ class TutorialResponse(BaseModel):
 # ============================================================================
 
 QUOTA_LIMITS = {
-    "citizen":     7,
-    "vanguard":    7,
-    "researcher":  7,
-    "government":  7,
-    "nihsa_staff": 7,
-    "sub_admin":   10,
-    "admin":       100,
+    "citizen":     5,
+    "vanguard":    10,
+    "researcher":  20,
+    "government":  20,
+    "nihsa_staff": 50,
+    "sub_admin":   50,
+    "admin":       999,
 }
 
 # Rate limiting stays in-memory (per-minute window, resets are fine)
@@ -254,7 +255,7 @@ def check_rate_limit(key: str, limit: int = 20, window: int = 60) -> bool:
 # NIHSA BACKEND — USER VERIFICATION
 # ============================================================================
 
-_user_cache: TTLCache = TTLCache(maxsize=500, ttl=300)
+_user_cache: TTLCache = TTLCache(maxsize=500, ttl=60)  # 60s — short enough to catch role changes
 
 async def verify_user_with_main_backend(auth_header: str) -> Optional[dict]:
     if not auth_header or not auth_header.startswith("Bearer "):
@@ -263,18 +264,28 @@ async def verify_user_with_main_backend(auth_header: str) -> Optional[dict]:
     cache_key = hashlib.md5(token.encode()).hexdigest()
     if cache_key in _user_cache:
         return _user_cache[cache_key]
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(
-                f"{NIHSA_API_URL}/auth/me",
-                headers={"Authorization": auth_header}
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                _user_cache[cache_key] = data
-                return data
-    except Exception as e:
-        logger.warning(f"User verification failed: {e}")
+    
+    # Try up to 2 times — handles cold starts where main backend is waking up
+    for attempt in range(2):
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(
+                    f"{NIHSA_API_URL}/auth/me",
+                    headers={"Authorization": auth_header}
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    _user_cache[cache_key] = data
+                    return data
+                elif resp.status_code == 401:
+                    return None  # Genuinely invalid token — no retry needed
+                # 5xx or other — retry once
+                if attempt == 0:
+                    await asyncio.sleep(1)
+        except Exception as e:
+            logger.warning(f"User verification attempt {attempt+1} failed: {e}")
+            if attempt == 0:
+                await asyncio.sleep(1)
     return None
 
 # ============================================================================
