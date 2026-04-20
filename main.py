@@ -38,10 +38,6 @@ CLOUDFLARE_API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "")
 if not CLOUDFLARE_API_TOKEN:
     raise ValueError("CLOUDFLARE_API_TOKEN not set!")
 
-# SerpAPI key for web search — add SERPAPI_KEY to Render env vars.
-# Free tier: 100 searches/month. Sign up at https://serpapi.com
-# Without this key, the AI falls back to training knowledge only.
-SERPAPI_KEY = os.environ.get("SERPAPI_KEY", "")
 
 # Worker proxy URL for STT (Cloudflare Worker)
 CLOUDFLARE_WORKER_URL = "https://nihsa-whisper-proxy.jonathankaleme.workers.dev"
@@ -1243,8 +1239,7 @@ TUTORIALS = {
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("NIHSA AI Wrapper starting — Cloudflare STT + MeloTTS + SerpAPI Web Search")
-    if not SERPAPI_KEY:
-        logger.warning("SERPAPI_KEY not set — web search disabled. Set it in Render env vars.")
+    
     await init_db_pool()
     await _cleanup_old_usage()
     yield
