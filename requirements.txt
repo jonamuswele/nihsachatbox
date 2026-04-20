@@ -7,3 +7,4 @@ python-multipart==0.0.20
 pydantic==2.10.5
 cachetools==5.5.0
 asyncpg
+duckduckgo-search>=6.3.0
