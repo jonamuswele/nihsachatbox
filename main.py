@@ -36,11 +36,6 @@ CLOUDFLARE_API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "")
 if not CLOUDFLARE_API_TOKEN:
     raise ValueError("CLOUDFLARE_API_TOKEN not set!")
 
-# Tavily API key for web search — add TAVILY_KEY to Render env vars.
-# Free tier: 1,000 searches/month. Sign up at https://tavily.com
-# Tavily is purpose-built for AI agents — returns clean pre-summarised results
-# plus a direct "answer" field so DeepSeek produces better, grounded responses.
-# Without this key, the AI falls back to training knowledge only.
 TAVILY_KEY = os.environ.get("TAVILY_KEY", "")
 
 # Worker proxy URL for STT (Cloudflare Worker)
