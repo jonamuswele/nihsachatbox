@@ -1517,7 +1517,37 @@ async def speak_endpoint(
         logger.error(f"TTS error: {e}")
         raise HTTPException(status_code=503, detail="Text-to-speech temporarily unavailable.")
 
-
+@app.get("/ai/quota/fast")
+async def get_quota_fast(req: Request):
+    """
+    Fast quota check — reads quota directly from DB without verifying the token
+    against the main backend. Token is decoded locally. Falls back to defaults
+    if the DB is unreachable. Used for initial page load to avoid the double
+    network hop cold start penalty.
+    """
+    from jose import jwt, JWTError
+    SECRET_KEY = os.environ.get("SECRET_KEY", "")
+    auth_header = req.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return {"remaining": 0, "limit": 0, "authenticated": False, "role": None}
+    token = auth_header[7:]
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+        user_id = payload.get("sub") or payload.get("user_id")
+        role = (payload.get("role") or "citizen").lower()
+    except JWTError:
+        return {"remaining": 0, "limit": 0, "authenticated": False, "role": None}
+    
+    limit = QUOTA_LIMITS.get(role, 5)
+    allowed, remaining, _ = await check_daily_quota(user_id, role)
+    return {
+        "remaining": remaining if allowed else 0,
+        "limit": limit,
+        "authenticated": True,
+        "role": role,
+        "reset_at": (datetime.now().date() + timedelta(days=1)).isoformat()
+    }
+    
 @app.get("/ai/quota")
 async def get_quota(req: Request):
     """Get remaining daily prompts for authenticated user."""
