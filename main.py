@@ -36,6 +36,11 @@ CLOUDFLARE_API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "")
 if not CLOUDFLARE_API_TOKEN:
     raise ValueError("CLOUDFLARE_API_TOKEN not set!")
 
+# Tavily API key for web search — add TAVILY_KEY to Render env vars.
+# Free tier: 1,000 searches/month. Sign up at https://tavily.com
+# Tavily is purpose-built for AI agents — returns clean pre-summarised results
+# plus a direct "answer" field so DeepSeek produces better, grounded responses.
+# Without this key, the AI falls back to training knowledge only.
 TAVILY_KEY = os.environ.get("TAVILY_KEY", "")
 
 # Worker proxy URL for STT (Cloudflare Worker)
@@ -1348,11 +1353,11 @@ async def chat_endpoint(request: Request, body: ChatRequest):
 
     # ── Detect language ───────────────────────────────────────────────────────
     language = body.language
-    if not language and body.messages:
-        last_msg = body.messages[-1].content
-        language = await detect_language_deepseek(last_msg)
+    last_user_msg = body.messages[-1].content if body.messages else ""
+    if not language and last_user_msg:
+        language = await detect_language_deepseek(last_user_msg)
         if language == "en":
-            language = detect_language_keywords(last_msg)
+            language = detect_language_keywords(last_user_msg)
     language = language or "en"
 
     # ── Build flood context ───────────────────────────────────────────────────
@@ -1416,8 +1421,19 @@ async def chat_endpoint(request: Request, body: ChatRequest):
     system_prompt = get_system_prompt(language)
     role_label = ROLE_LABELS.get(role, "User")
 
+    # Language enforcement appended to every system prompt so DeepSeek
+    # consistently replies in the user's detected language regardless of
+    # what language the search results or tool responses arrive in.
+    lang_enforce = {
+        "ha": "\n\nCRITICAL: Your entire reply MUST be in Hausa language. Do not switch to English.",
+        "yo": "\n\nCRITICAL: Your entire reply MUST be in Yoruba language. Do not switch to English.",
+        "ig": "\n\nCRITICAL: Your entire reply MUST be in Igbo language. Do not switch to English.",
+        "fr": "\n\nCRITICAL: Your entire reply MUST be in French. Do not switch to English.",
+        "en": "",
+    }.get(language, "")
+
     full_system = (
-        f"{system_prompt}\n\n"
+        f"{system_prompt}{lang_enforce}\n\n"
         f"USER CONTEXT:\n"
         f"  Role: {role_label}\n"
         f"  Prompts remaining today: {remaining}/{limit}\n"
@@ -1428,6 +1444,96 @@ async def chat_endpoint(request: Request, body: ChatRequest):
     messages = [{"role": "system", "content": full_system}]
     for msg in body.messages[-10:]:
         messages.append({"role": msg.role, "content": msg.content})
+
+    # ── INTENT DETECTION — pre-fetch search results before calling DeepSeek ──
+    # DeepSeek's function calling is unreliable — it sometimes outputs raw XML
+    # instead of a structured tool call. To make search 100% reliable we detect
+    # search and emergency intent directly from the user's message and execute
+    # Tavily BEFORE calling DeepSeek, then inject the results into the system
+    # prompt as context. DeepSeek then answers using real data without needing
+    # to call a tool at all. This approach works every time regardless of how
+    # DeepSeek formats its tool call output.
+
+    SEARCH_INTENT_KEYWORDS = {
+        # English
+        "search", "check", "look up", "find out", "verify", "confirm", "what's happening",
+        "what is happening", "any news", "is there", "are there", "recent", "latest",
+        "current", "now", "today", "speculations", "rumours", "rumors", "reports",
+        "heard that", "internet says", "app not reporting", "not showing", "check the web",
+        "check online", "search online", "look online",
+        # Hausa
+        "bincika", "duba", "nemo", "tabbatar", "labarai", "yanzu", "yau",
+        # Yoruba
+        "wa", "ṣayẹwo", "ṣawari", "wa iroyin", "bayi", "loni",
+        # Igbo
+        "chọọ", "lelee", "nchọpụta", "ugbu a", "taa",
+        # French
+        "chercher", "vérifier", "trouver", "actualités", "maintenant", "aujourd",
+        "il y a", "nouvelles", "récent",
+    }
+
+    EMERGENCY_CONTACT_KEYWORDS = {
+        # English
+        "emergency number", "emergency contact", "who to call", "phone number",
+        "hotline", "nema number", "sema number", "police number", "fire number",
+        "ambulance", "call for help", "contact number",
+        # Hausa
+        "lambar waya", "lambar gaggawa", "kira", "taimako",
+        # Yoruba
+        "nọmba", "pe ẹnikan", "iranlọwọ",
+        # Igbo
+        "nọmba", "kpọọ", "enyemaka",
+        # French
+        "numéro", "appeler", "urgence",
+    }
+
+    msg_lower = last_user_msg.lower()
+    injected_search_context = ""
+
+    # Check for emergency contact intent
+    if any(kw in msg_lower for kw in EMERGENCY_CONTACT_KEYWORDS):
+        # Extract state hint from message if present
+        state_hint = ""
+        nigeria_states = [
+            "abia", "adamawa", "akwa ibom", "anambra", "bauchi", "bayelsa", "benue",
+            "borno", "cross river", "delta", "ebonyi", "edo", "ekiti", "enugu",
+            "gombe", "imo", "jigawa", "kaduna", "kano", "katsina", "kebbi", "kogi",
+            "kwara", "lagos", "nasarawa", "niger", "ogun", "ondo", "osun", "oyo",
+            "plateau", "rivers", "sokoto", "taraba", "yobe", "zamfara", "abuja", "fct"
+        ]
+        for state in nigeria_states:
+            if state in msg_lower:
+                state_hint = state.title()
+                break
+        logger.info(f"Emergency contact intent detected — state: '{state_hint or 'national'}'")
+        contacts = await fetch_emergency_contacts(state_hint)
+        injected_search_context = f"\n\nLIVE EMERGENCY CONTACTS (fetched now for this user):\n{contacts}"
+
+    # Check for web search intent (flood/hydrology news)
+    elif any(kw in msg_lower for kw in SEARCH_INTENT_KEYWORDS):
+        # Build a focused query from the message content
+        # Strip filler phrases and keep the geographic/topic core
+        search_query = last_user_msg[:200]
+        # Always append Nigeria context to keep results scoped
+        if "nigeria" not in msg_lower:
+            search_query = search_query + " Nigeria flood"
+        logger.info(f"Search intent detected — querying Tavily: '{search_query[:80]}'")
+        search_results = await execute_web_search(search_query)
+        injected_search_context = (
+            f"\n\nLIVE WEB SEARCH RESULTS (fetched now from Tavily for this query):\n"
+            f"{search_results}\n\n"
+            f"INSTRUCTION: Use the above search results to answer the user's question directly. "
+            f"If the results confirm flooding somewhere, say so clearly. "
+            f"If they don't confirm it, say that too. Be factual. "
+            f"Always respond in the user's language ({language})."
+        )
+
+    # Inject search results into the system prompt if we fetched anything
+    if injected_search_context:
+        full_system_with_search = full_system + injected_search_context
+        messages[0]["content"] = full_system_with_search
+    else:
+        full_system_with_search = full_system
 
     try:
         response = await deepseek_client.chat.completions.create(
@@ -1442,17 +1548,32 @@ async def chat_endpoint(request: Request, body: ChatRequest):
         message = response.choices[0].message
         await increment_usage(user_id, role)
 
-        # ── Handle tool calls ─────────────────────────────────────────────────
+        # ── Strip any leaked DeepSeek XML from message.content ────────────────
+        # DeepSeek sometimes outputs raw <｜DSML｜function_calls> XML in
+        # message.content alongside the structured tool_calls object. We strip
+        # it so it never reaches the user.
+        raw_content = message.content or ""
+        dsml_markers = ["<｜DSML｜", "<|DSML|", "function_calls>", "<｜invoke", "DSML｜function"]
+        content_has_leaked_xml = any(m in raw_content for m in dsml_markers)
+        clean_content = "" if content_has_leaked_xml else raw_content
+
+        # ── Handle structured tool calls ──────────────────────────────────────
         if message.tool_calls:
             tool_call = message.tool_calls[0]
             tool_name = tool_call.function.name
             tool_params = json.loads(tool_call.function.arguments)
 
-            # ── web_search_hydrology ─────────────────────────────────────────
+            # ── web_search_hydrology ──────────────────────────────────────────
             if tool_name == "web_search_hydrology":
                 search_query = tool_params.get("query", "")
-                logger.info(f"Web search triggered: '{search_query}'")
-                search_results = await execute_web_search(search_query)
+                logger.info(f"Tool call: web_search_hydrology — '{search_query}'")
+
+                # If we already pre-fetched results via intent detection,
+                # reuse them — don't burn another Tavily quota call
+                if injected_search_context and "WEB SEARCH RESULTS" in injected_search_context:
+                    search_results = injected_search_context
+                else:
+                    search_results = await execute_web_search(search_query)
 
                 messages_with_result = messages + [
                     {
@@ -1471,6 +1592,17 @@ async def chat_endpoint(request: Request, body: ChatRequest):
                         "role": "tool",
                         "tool_call_id": tool_call.id,
                         "content": search_results
+                    },
+                    # Re-enforce language after tool result since tool content
+                    # arrives in English which can confuse the model
+                    {
+                        "role": "system",
+                        "content": (
+                            f"The above search results are in English. "
+                            f"Summarise and answer the user's question based on these results. "
+                            f"Your reply MUST be in this language: {language}. "
+                            f"Be direct and factual. Under 150 words."
+                        )
                     }
                 ]
 
@@ -1486,11 +1618,15 @@ async def chat_endpoint(request: Request, body: ChatRequest):
                 )
                 return ChatResponse(reply=reply, action=None, detected_language=language)
 
-            # ── get_emergency_contacts ───────────────────────────────────────
+            # ── get_emergency_contacts ────────────────────────────────────────
             if tool_name == "get_emergency_contacts":
                 state = tool_params.get("state", "")
-                logger.info(f"Emergency contacts requested: state='{state or 'national'}'")
-                contacts_data = await fetch_emergency_contacts(state)
+                logger.info(f"Tool call: get_emergency_contacts — state='{state or 'national'}'")
+
+                if injected_search_context and "EMERGENCY CONTACTS" in injected_search_context:
+                    contacts_data = injected_search_context
+                else:
+                    contacts_data = await fetch_emergency_contacts(state)
 
                 messages_with_result = messages + [
                     {
@@ -1509,6 +1645,14 @@ async def chat_endpoint(request: Request, body: ChatRequest):
                         "role": "tool",
                         "tool_call_id": tool_call.id,
                         "content": contacts_data
+                    },
+                    {
+                        "role": "system",
+                        "content": (
+                            f"Present the emergency contacts clearly and helpfully. "
+                            f"Your reply MUST be in this language: {language}. "
+                            f"Lead with the most important numbers. Under 120 words."
+                        )
                     }
                 ]
 
@@ -1531,11 +1675,8 @@ async def chat_endpoint(request: Request, body: ChatRequest):
                 )
                 return ChatResponse(reply=reply, action=None, detected_language=language)
 
-            # ── All other app navigation/action tools ────────────────────────
-            action = {
-                "type": tool_name,
-                "params": tool_params
-            }
+            # ── All other app navigation/action tools ─────────────────────────
+            action = {"type": tool_name, "params": tool_params}
 
             action_context = {
                 "navigate_to_report": (
@@ -1561,7 +1702,7 @@ async def chat_endpoint(request: Request, body: ChatRequest):
                 ),
                 "search_location": (
                     f"You are searching the map for: {tool_params.get('query', '')}. "
-                    "Tell them you are showing it on the map and give any relevant flood risk info for that area."
+                    "Tell them you are showing it on the map and give any relevant flood risk info."
                 ),
             }.get(tool_name, "Give the user helpful flood safety guidance relevant to their request and location.")
 
@@ -1569,12 +1710,12 @@ async def chat_endpoint(request: Request, body: ChatRequest):
                 follow_up = await deepseek_client.chat.completions.create(
                     model="deepseek-chat",
                     messages=[
-                        {"role": "system", "content": full_system},
+                        {"role": "system", "content": full_system_with_search},
                         *[{"role": m.role, "content": m.content} for m in body.messages[-6:]],
                         {"role": "system", "content": (
                             f"INSTRUCTION FOR THIS REPLY ONLY: {action_context} "
-                            "Keep your response under 120 words. Be direct and actionable. "
-                            "Do NOT say 'Let me help' or 'I will help'. Start with the actual content."
+                            f"Your reply MUST be in this language: {language}. "
+                            "Under 120 words. Be direct. Do NOT say 'Let me help' — start with the content."
                         )},
                     ],
                     max_tokens=200,
@@ -1593,8 +1734,36 @@ async def chat_endpoint(request: Request, body: ChatRequest):
 
             return ChatResponse(reply=reply, action=action, detected_language=language)
 
-        # ── No tool call — plain text response ───────────────────────────────
-        reply = message.content or "I'm here to help with flood safety. Please ask a hydrology-related question."
+        # ── No structured tool call from DeepSeek ─────────────────────────────
+        # This handles three cases:
+        # 1. DeepSeek returned a plain text answer (normal — no search needed)
+        # 2. DeepSeek leaked XML in message.content (content_has_leaked_xml=True)
+        # 3. We already pre-fetched search results via intent detection, so
+        #    DeepSeek answered from context without calling a tool (also normal)
+        if content_has_leaked_xml:
+            # XML leaked — DeepSeek tried to call a tool but failed to structure it.
+            # We already have search results in the system prompt from intent detection
+            # if relevant. Ask DeepSeek again without tools to get a clean answer.
+            logger.warning("DeepSeek leaked XML in message.content — re-prompting without tools")
+            retry_response = await deepseek_client.chat.completions.create(
+                model="deepseek-chat",
+                messages=messages + [{
+                    "role": "system",
+                    "content": (
+                        "The search results are already in your context above. "
+                        "Answer the user's question directly based on those results. "
+                        f"Your reply MUST be in this language: {language}. "
+                        "Do not output any XML or function call syntax. Plain text only."
+                    )
+                }],
+                # No tools — forces a plain text response
+                max_tokens=600,
+                temperature=0.4,
+            )
+            reply = retry_response.choices[0].message.content or "I searched for that information but encountered a technical issue. Please try again."
+        else:
+            reply = clean_content or "I'm here to help with flood safety. Please ask a hydrology-related question."
+
         return ChatResponse(reply=reply, action=None, detected_language=language)
 
     except Exception as e:
