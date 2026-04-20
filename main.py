@@ -469,23 +469,6 @@ async def detect_language_deepseek(text: str) -> str:
     except Exception:
         return "en"
 
-# ============================================================================
-# STT — Cloudflare Whisper Large v3 Turbo via Worker proxy
-#
-# Root cause of the 500 error:
-#   The original Worker read request.arrayBuffer() (raw binary).
-#   Our wrapper was sending json=payload (JSON body) → Worker got garbage bytes.
-#
-# Fix:
-#   Updated Worker now accepts Content-Type: application/json and forwards all
-#   Whisper hyperparameters to the AI binding. Python sends JSON, not raw bytes.
-#
-# Advanced params we now use:
-#   initial_prompt (→ prompt in Worker)        : hydrology context for better accuracy
-#   vad_filter                                 : strip silence / reduce hallucinations  
-#   num_beams (beam_count in our API)          : 5 beams → better multilingual accuracy
-#   condition_on_previous_text=False           : prevent repetition loops
-# ============================================================================
 
 WHISPER_HYDROLOGY_PROMPT = (
     "NIHSA flood report. Nigeria hydrology. "
@@ -1149,7 +1132,7 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "Location search query"}
+                    "query": {"type": "string", "description": "Location search query, The exact location name only. Examples: 'Lokoja', 'Makurdi', 'Kogi State', 'Benue River', 'Lagos'. NOT full sentences. "}
                 },
                 "required": ["query"]
             }
