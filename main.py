@@ -20,8 +20,6 @@ from pydantic import BaseModel, Field
 from openai import AsyncOpenAI
 from cachetools import TTLCache
 
-from duckduckgo_search import DDGS
-
 # ============================================================================
 # CONFIGURATION & ENVIRONMENT
 # ============================================================================
@@ -38,6 +36,12 @@ CLOUDFLARE_API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "")
 if not CLOUDFLARE_API_TOKEN:
     raise ValueError("CLOUDFLARE_API_TOKEN not set!")
 
+# Tavily API key for web search — add TAVILY_KEY to Render env vars.
+# Free tier: 1,000 searches/month. Sign up at https://tavily.com
+# Tavily is purpose-built for AI agents — returns clean pre-summarised results
+# plus a direct "answer" field so DeepSeek produces better, grounded responses.
+# Without this key, the AI falls back to training knowledge only.
+TAVILY_KEY = os.environ.get("TAVILY_KEY", "")
 
 # Worker proxy URL for STT (Cloudflare Worker)
 CLOUDFLARE_WORKER_URL = "https://nihsa-whisper-proxy.jonathankaleme.workers.dev"
@@ -276,89 +280,77 @@ _search_cache: TTLCache = TTLCache(maxsize=200, ttl=1800)
 async def execute_web_search(query: str) -> str:
     """
     Execute a web search scoped to hydrology and emergency topics.
-    Uses free DuckDuckGo search — no API key required.
-    Results are cached for 30 minutes.
+    Uses Tavily API — purpose-built for AI agents.
+    Configure TAVILY_KEY in Render environment variables.
+
+    Tavily advantages over SerpAPI:
+    - Returns a direct "answer" field — one clean sentence DeepSeek can use immediately
+    - Pre-filters junk results automatically
+    - include_raw_content=False keeps payloads small
+    - Nigeria search bias via query construction
+    Results cached 30 minutes to preserve the 1,000/month free tier.
     """
+    if not TAVILY_KEY:
+        return (
+            "Web search is not configured (TAVILY_KEY missing on server). "
+            "Answering from training knowledge only."
+        )
+
     cache_key = hashlib.md5(query.lower().strip().encode()).hexdigest()
     if cache_key in _search_cache:
         logger.info(f"Search cache hit: '{query[:60]}'")
         return _search_cache[cache_key]
 
-    # Add Nigeria context and news focus
-    enhanced_query = query
-    if "nigeria" not in query.lower():
-        enhanced_query = f"{query} Nigeria"
-    
-    # Add "news" if it's about current events
-    if any(word in query.lower() for word in ["today", "current", "now", "recent", "happening"]):
-        enhanced_query = f"{enhanced_query} news"
-
     try:
-        loop = asyncio.get_event_loop()
-        
-        def do_search():
-            results = []
-            with DDGS() as ddgs:
-                # Try news search first for current events
-                if "news" in enhanced_query.lower() or "today" in enhanced_query.lower():
-                    for r in ddgs.news(
-                        enhanced_query.replace(" news", ""),
-                        region="ng",
-                        safesearch="moderate",
-                        max_results=5,
-                        timelimit="w"  # Past week for news
-                    ):
-                        results.append({
-                            "title": r.get("title", ""),
-                            "body": r.get("body", ""),
-                            "href": r.get("url", ""),
-                            "source": r.get("source", "News source")
-                        })
-                
-                # Fall back to general search if news yields nothing
-                if not results:
-                    for r in ddgs.text(
-                        enhanced_query, 
-                        region="ng", 
-                        safesearch="moderate", 
-                        max_results=5,
-                        timelimit="m"  # Past month
-                    ):
-                        results.append({
-                            "title": r.get("title", ""),
-                            "body": r.get("body", ""),
-                            "href": r.get("href", ""),
-                        })
-            return results
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                "https://api.tavily.com/search",
+                json={
+                    "api_key":             TAVILY_KEY,
+                    "query":               query,
+                    "max_results":         5,
+                    "include_answer":      True,   # key feature — direct one-sentence answer
+                    "include_raw_content": False,  # keep payload small
+                    "search_depth":        "advanced",  # deeper crawl for better results
+                },
+                headers={"Content-Type": "application/json"},
+            )
 
-        search_results = await loop.run_in_executor(None, do_search)
+        if resp.status_code != 200:
+            logger.warning(f"Tavily returned {resp.status_code}: {resp.text[:200]}")
+            return f"Web search failed (HTTP {resp.status_code}). Answering from training knowledge."
 
-        if not search_results:
-            return "No recent web results found for that query. You may want to check official NIHSA channels or NEMA social media for real-time updates."
+        data = resp.json()
 
-        lines = []
-        for r in search_results[:4]:
-            title = r.get("title", "")
-            snippet = r.get("body", "")[:300]  # Limit snippet length
-            link = r.get("href", "")
-            source = r.get("source", "")
-            
-            line = f"• {title}"
-            if source:
-                line += f" ({source})"
-            line += f"\n  {snippet}..."
-            if link:
-                line += f"\n  🔗 {link}"
-            lines.append(line)
+        parts = []
 
-        formatted = "\n\n".join(lines)
+        # Tavily's direct answer — the best single sentence summary of the results
+        direct_answer = data.get("answer", "")
+        if direct_answer:
+            parts.append(f"[Direct answer] {direct_answer}")
+
+        # Supporting results for context
+        results = data.get("results", [])
+        if results:
+            for r in results[:4]:
+                title   = r.get("title", "")
+                content = r.get("content", "")   # Tavily returns content not snippet
+                url     = r.get("url", "")
+                if title or content:
+                    parts.append(f"• {title}\n  {content[:300]}\n  Source: {url}")
+
+        if not parts:
+            return "No web results found for that query. Answering from training knowledge."
+
+        formatted = "\n\n".join(parts)
         _search_cache[cache_key] = formatted
-        logger.info(f"Web search done: '{enhanced_query[:60]}' — {len(search_results)} results")
+        logger.info(f"Tavily search done: '{query[:60]}' — answer={bool(direct_answer)}, results={len(results)}")
         return formatted
 
     except Exception as e:
-        logger.warning(f"Web search error for '{query}': {e}")
-        return "Web search temporarily unavailable. Please check NIHSA official channels for the latest updates."
+        logger.warning(f"Tavily search error for '{query}': {e}")
+        return "Web search temporarily unavailable. Answering from training knowledge."
+
 
 async def fetch_emergency_contacts(state: str = "") -> str:
     """
@@ -366,7 +358,7 @@ async def fetch_emergency_contacts(state: str = "") -> str:
     Provides known baseline numbers plus live search results.
     """
     state_str = f"{state} " if state else ""
-    query = f"Nigeria {state_str}emergency contact numbers NEMA SEMA flood 2025 official hotline"
+    query = f"Nigeria {state_str}emergency contact numbers NEMA SEMA flood 2026 official hotline phone"
     search_results = await execute_web_search(query)
 
     baseline = (
@@ -1271,8 +1263,9 @@ TUTORIALS = {
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("NIHSA AI Wrapper starting — Cloudflare STT + MeloTTS + SerpAPI Web Search")
-    
+    logger.info("NIHSA AI Wrapper starting — Cloudflare STT + MeloTTS + Tavily Web Search")
+    if not TAVILY_KEY:
+        logger.warning("TAVILY_KEY not set — web search disabled. Set TAVILY_KEY in Render env vars.")
     await init_db_pool()
     await _cleanup_old_usage()
     yield
@@ -1304,7 +1297,7 @@ async def health_check():
         "stt_provider": "Cloudflare Workers AI — whisper-large-v3-turbo",
         "tts_provider": "Cloudflare Workers AI — MeloTTS",
         "llm_provider": "DeepSeek Chat",
-        "web_search": "DuckDuckGo — free hydrology search (Nigeria-focused)",
+        "web_search": "Tavily — hydrology and emergency contacts, AI-optimised" if TAVILY_KEY else "DISABLED — set TAVILY_KEY in Render env vars",
         "quota_backend": "PostgreSQL" if DATABASE_URL else "in-memory fallback",
     }
 
