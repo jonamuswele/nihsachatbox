@@ -20,6 +20,8 @@ from pydantic import BaseModel, Field
 from openai import AsyncOpenAI
 from cachetools import TTLCache
 
+from duckduckgo_search import DDGS
+
 # ============================================================================
 # CONFIGURATION & ENVIRONMENT
 # ============================================================================
@@ -278,67 +280,56 @@ _search_cache: TTLCache = TTLCache(maxsize=200, ttl=1800)
 async def execute_web_search(query: str) -> str:
     """
     Execute a web search scoped to hydrology and emergency topics.
-    Uses SerpAPI — configure SERPAPI_KEY in Render environment variables.
+    Uses free DuckDuckGo search — no API key required.
     Results are cached for 30 minutes.
-    Falls back gracefully if the key is not configured.
     """
-    if not SERPAPI_KEY:
-        return (
-            "Web search is not configured (SERPAPI_KEY missing on server). "
-            "Answering from training knowledge only."
-        )
-
     cache_key = hashlib.md5(query.lower().strip().encode()).hexdigest()
     if cache_key in _search_cache:
         logger.info(f"Search cache hit: '{query[:60]}'")
         return _search_cache[cache_key]
 
+    # Add Nigeria context to the query if not already present
+    if "nigeria" not in query.lower():
+        query = f"{query} Nigeria"
+
     try:
-        async with httpx.AsyncClient(timeout=12) as client:
-            resp = await client.get(
-                "https://serpapi.com/search",
-                params={
-                    "q": query,
-                    "api_key": SERPAPI_KEY,
-                    "num": 5,
-                    "gl": "ng",    # bias results toward Nigeria
-                    "hl": "en",
-                }
-            )
+        # Run blocking search in a thread pool since DDGS is synchronous
+        loop = asyncio.get_event_loop()
+        
+        def do_search():
+            results = []
+            with DDGS() as ddgs:
+                # Search with region set to Nigeria (ng)
+                for r in ddgs.text(
+                    query, 
+                    region="ng", 
+                    safesearch="moderate", 
+                    max_results=5,
+                    timelimit="y"  # Past year for freshness
+                ):
+                    results.append(r)
+            return results
 
-        if resp.status_code != 200:
-            logger.warning(f"SerpAPI returned {resp.status_code}")
-            return f"Web search failed (HTTP {resp.status_code}). Answering from training knowledge."
+        search_results = await loop.run_in_executor(None, do_search)
 
-        data = resp.json()
-
-        # Use answer box if available (concise factual answer)
-        answer_box = data.get("answer_box", {})
-        if answer_box.get("answer"):
-            result = f"[Direct answer] {answer_box['answer']}"
-            _search_cache[cache_key] = result
-            return result
-
-        results = data.get("organic_results", [])
-        if not results:
+        if not search_results:
             return "No web results found for that query. Answering from training knowledge."
 
         lines = []
-        for r in results[:4]:
-            title   = r.get("title", "")
-            snippet = r.get("snippet", "")
-            link    = r.get("link", "")
+        for r in search_results[:4]:
+            title = r.get("title", "")
+            snippet = r.get("body", "")  # DuckDuckGo uses 'body' not 'snippet'
+            link = r.get("href", "")
             lines.append(f"• {title}\n  {snippet}\n  Source: {link}")
 
         formatted = "\n\n".join(lines)
         _search_cache[cache_key] = formatted
-        logger.info(f"Web search done: '{query[:60]}' — {len(results)} results")
+        logger.info(f"Web search done: '{query[:60]}' — {len(search_results)} results")
         return formatted
 
     except Exception as e:
         logger.warning(f"Web search error for '{query}': {e}")
         return "Web search temporarily unavailable. Answering from training knowledge."
-
 
 async def fetch_emergency_contacts(state: str = "") -> str:
     """
