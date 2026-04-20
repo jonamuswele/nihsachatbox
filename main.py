@@ -284,48 +284,81 @@ async def execute_web_search(query: str) -> str:
         logger.info(f"Search cache hit: '{query[:60]}'")
         return _search_cache[cache_key]
 
-    # Add Nigeria context to the query if not already present
+    # Add Nigeria context and news focus
+    enhanced_query = query
     if "nigeria" not in query.lower():
-        query = f"{query} Nigeria"
+        enhanced_query = f"{query} Nigeria"
+    
+    # Add "news" if it's about current events
+    if any(word in query.lower() for word in ["today", "current", "now", "recent", "happening"]):
+        enhanced_query = f"{enhanced_query} news"
 
     try:
-        # Run blocking search in a thread pool since DDGS is synchronous
         loop = asyncio.get_event_loop()
         
         def do_search():
             results = []
             with DDGS() as ddgs:
-                # Search with region set to Nigeria (ng)
-                for r in ddgs.text(
-                    query, 
-                    region="ng", 
-                    safesearch="moderate", 
-                    max_results=5,
-                    timelimit="y"  # Past year for freshness
-                ):
-                    results.append(r)
+                # Try news search first for current events
+                if "news" in enhanced_query.lower() or "today" in enhanced_query.lower():
+                    for r in ddgs.news(
+                        enhanced_query.replace(" news", ""),
+                        region="ng",
+                        safesearch="moderate",
+                        max_results=5,
+                        timelimit="w"  # Past week for news
+                    ):
+                        results.append({
+                            "title": r.get("title", ""),
+                            "body": r.get("body", ""),
+                            "href": r.get("url", ""),
+                            "source": r.get("source", "News source")
+                        })
+                
+                # Fall back to general search if news yields nothing
+                if not results:
+                    for r in ddgs.text(
+                        enhanced_query, 
+                        region="ng", 
+                        safesearch="moderate", 
+                        max_results=5,
+                        timelimit="m"  # Past month
+                    ):
+                        results.append({
+                            "title": r.get("title", ""),
+                            "body": r.get("body", ""),
+                            "href": r.get("href", ""),
+                        })
             return results
 
         search_results = await loop.run_in_executor(None, do_search)
 
         if not search_results:
-            return "No web results found for that query. Answering from training knowledge."
+            return "No recent web results found for that query. You may want to check official NIHSA channels or NEMA social media for real-time updates."
 
         lines = []
         for r in search_results[:4]:
             title = r.get("title", "")
-            snippet = r.get("body", "")  # DuckDuckGo uses 'body' not 'snippet'
+            snippet = r.get("body", "")[:300]  # Limit snippet length
             link = r.get("href", "")
-            lines.append(f"• {title}\n  {snippet}\n  Source: {link}")
+            source = r.get("source", "")
+            
+            line = f"• {title}"
+            if source:
+                line += f" ({source})"
+            line += f"\n  {snippet}..."
+            if link:
+                line += f"\n  🔗 {link}"
+            lines.append(line)
 
         formatted = "\n\n".join(lines)
         _search_cache[cache_key] = formatted
-        logger.info(f"Web search done: '{query[:60]}' — {len(search_results)} results")
+        logger.info(f"Web search done: '{enhanced_query[:60]}' — {len(search_results)} results")
         return formatted
 
     except Exception as e:
         logger.warning(f"Web search error for '{query}': {e}")
-        return "Web search temporarily unavailable. Answering from training knowledge."
+        return "Web search temporarily unavailable. Please check NIHSA official channels for the latest updates."
 
 async def fetch_emergency_contacts(state: str = "") -> str:
     """
@@ -1271,7 +1304,7 @@ async def health_check():
         "stt_provider": "Cloudflare Workers AI — whisper-large-v3-turbo",
         "tts_provider": "Cloudflare Workers AI — MeloTTS",
         "llm_provider": "DeepSeek Chat",
-        "web_search": "SerpAPI — hydrology and emergency contacts scoped to Nigeria" if SERPAPI_KEY else "DISABLED — set SERPAPI_KEY env var",
+        "web_search": "DuckDuckGo — free hydrology search (Nigeria-focused)",
         "quota_backend": "PostgreSQL" if DATABASE_URL else "in-memory fallback",
     }
 
