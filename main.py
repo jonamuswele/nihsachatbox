@@ -49,7 +49,7 @@ CLOUDFLARE_WORKER_URL = "https://nihsa-whisper-proxy.jonathankaleme.workers.dev"
 # Cloudflare Workers AI direct endpoint (for TTS — MeloTTS)
 CF_AI_BASE = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run"
 
-NIHSA_API_URL = os.environ.get("NIHSA_API_URL", "https://nihsa-backend-20hh.onrender.com/api")
+NIHSA_API_URL = os.environ.get("NIHSA_API_URL", "https://nihsa-backend-x3us.onrender.com/api")
 ALLOWED_ORIGINS = os.environ.get(
     "ALLOWED_ORIGINS",
     "capacitor://localhost,http://localhost:3000,https://nihsa-backend-20hh.onrender.com"
